@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import pygit2
+from pathlib import Path
+import sys
+
+def get_modified_docx_files(commit):
+    """
+    Return a list of modified docx files for current commit.
+    """
+    parents = commit.parents
+    if not parents:
+        diff = commit.tree.diff_to_tree(swap=True)
+    else:
+        diff = parents[0].tree.diff_to_tree(commit.tree)
+
+    modified = []
+    for patch in diff:
+        path = patch.delta.new_file.path
+        if path.endswith('.docx') and patch.delta.status_char() in ('A', 'M'):
+            modified.append(path)
+    return modified
+
+def read_pointer_file_from_commit(repo, commit, path):
+    try:
+        entry = commit.tree[path]
+        blob = repo[entry.id]
+        return blob.data.decode("utf-8")
+    except (KeyError, UnicodeDecodeError) as e:
+        print(f"Error reading pointer file {path}: {e}", file=sys.stderr)
+        return None
+
+def parse_ref_from_pointer(pointer_text):
+    """
+    Read custom reference path from pointer file.
+    """
+    for line in pointer_text.splitlines():
+        if line.startswith("DOCX-POINTER:"):
+            return line[len("DOCX-POINTER:"):].strip()
+    return None
+
+def main():
+    repo = pygit2.Repository(pygit2.discover_repository(str(Path.cwd())))
+    commit = repo.head.peel()
+    
+    # Check if there are any modified or added docx files:
+    modified_files = get_modified_docx_files(commit)
+    if not modified_files:
+        print("No .docx files added or modified in last commit.", file=sys.stderr)
+        return
+
+    for path in modified_files:
+        print(f"Processing {path}...", file=sys.stderr)
+        # Read pointer file:
+        pointer_text = read_pointer_file_from_commit(repo, commit, path)
+        if not pointer_text:
+            continue
+        
+        # Find ref path:
+        refname = parse_ref_from_pointer(pointer_text)
+        if not refname:
+            print(f"No DOCX-POINTER ref found in {path}", file=sys.stderr)
+            continue
+        
+        # Find git tree that contains xmls:
+        try:
+            tree_oid_file = Path(repo.path) / "docx-tree-oid"
+            tree_oid = tree_oid_file.read_text(encoding="utf-8").strip()
+            obj = repo[tree_oid]
+            if obj.type_str == 'tree':
+                tree = obj
+            # TODO: test without elif block
+            elif obj.type_str == 'commit':
+                tree = obj.tree
+            else:
+                raise TypeError(f"Ref {refname} does not point to a tree or commit.")
+        except Exception as e:
+            print(f"Error resolving tree from ref {refname}, object type = {obj.type}, tree = {pygit2.Tree.type}, commit = {pygit2.Commit.type}: {e}", file=sys.stderr)
+            continue
+        
+        # Use HEAD commit as parent:
+        try:
+            head_commit = repo.revparse_single("HEAD")
+            if head_commit.type != 1:
+                raise TypeError("HEAD is not a commit")
+            parents = [head_commit.id]
+        except Exception as e:
+            print(f"No valid HEAD commit found: {e}", file=sys.stderr)
+            parents = []
+
+        # Create commit (commit-tree functionallity):
+        author = pygit2.Signature("user", "user@mail.com")
+        commit_msg = f"Auto-commit for {path} tree"
+        try:
+            commit_oid = repo.create_commit(
+                None,
+                author,
+                author,
+                commit_msg,
+                tree.id,
+                parents
+            )
+            print(f"Created commit {commit_oid} for ref {refname}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error creating commit for ref {refname}: {e}", file=sys.stderr)
+        
+        if commit_oid is None:
+            print("commit oid is none")
+        obj = repo[commit_oid]
+        print(f"Created object: {commit_oid}, type = {obj.type}, class = {type(obj)}", file=sys.stderr)
+        
+        # Create custom reference pointing to the commit oid:
+        if refname in repo.references:
+            repo.references.delete(refname)
+        repo.references.create(refname, commit_oid, force=True)
+
+if __name__ == "__main__":
+    main()
