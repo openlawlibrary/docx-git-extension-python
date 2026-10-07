@@ -147,6 +147,7 @@ def _unpack_entries(b: bytes) -> List[Dict]:
         raise ValueError('Bad v3 meta magic')
     p += 4
     count = read_u32(b, p); p += 4
+    _global_flags = read_u32(b, p); p += 4
     entries: List[Dict] = []
     for _ in range(count):
         name_len = read_u16(b, p); p += 2
@@ -419,14 +420,15 @@ def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
         # Log outcome
         logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
 
-        # If expected hash provided and still mismatched, log an error explicitly
+        # If expected hash provided and still mismatched, log an error explicitly.
+        # Still emit the best-effort rebuild: writing nothing leaves a 0-byte docx in
+        # the working tree, which then breaks every later clean filter run.
         if expected_hash and meta["sha"] != expected_hash:
             logging.error(f"Hash mismatch. Expected: {expected_hash}, Got: {meta['sha']} (profile={profile})")
-            sys.stdout.buffer.write("")
         else:
             logging.info("Hash matched expected.")
-            # Write result to stdout
-            sys.stdout.buffer.write(docx_bytes)
+        # Write result to stdout
+        sys.stdout.buffer.write(docx_bytes)
 
 def main():
     logging.info("docx_smudge_final.py started")
@@ -461,6 +463,9 @@ def main():
         recreate_docx(repo, refname, expected_hash, metadata_line)
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")
+        # Fail loudly: exiting 0 with empty stdout makes git write a 0-byte docx.
+        sys.stderr.write(f"smudge_filter.py: failed to recreate docx from '{refname}': {e}\n")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
