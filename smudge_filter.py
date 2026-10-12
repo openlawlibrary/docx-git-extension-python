@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Tuple
 import tempfile
 import pygit2
 import logging
+import msword_compressor
 from utils.utils import (read_u16, read_u32, decode_b85, calculate_sha256)
 
 SIG_LFH   = 0x04034B50
@@ -22,7 +23,8 @@ GPF_DATA_DESCRIPTOR = 0x0008
 GPF_UTF8            = 0x0800
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
-META_MAGIC = b"DM3\x00"
+META_MAGIC_V3 = b"DM3\x00"   # pointers written before flush offsets existed
+META_MAGIC = b"DM4\x00"
 
 log_path = Path.cwd() / "docx_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
@@ -143,8 +145,10 @@ def parse_lfh(buf: bytes, off: int) -> Dict:
 
 def _unpack_entries(b: bytes) -> List[Dict]:
     p = 0
-    if b[p:p+4] != META_MAGIC:
-        raise ValueError('Bad v3 meta magic')
+    magic = b[p:p+4]
+    if magic not in (META_MAGIC, META_MAGIC_V3):
+        raise ValueError('Bad meta magic')
+    has_flush = (magic == META_MAGIC)
     p += 4
     count = read_u32(b, p); p += 4
     _global_flags = read_u32(b, p); p += 4
@@ -163,6 +167,11 @@ def _unpack_entries(b: bytes) -> List[Dict]:
         cm_len = read_u16(b, p); p += 2
         comment = b[p:p+cm_len]; p += cm_len
         use_dd = b[p]; dd_sig = b[p+1]; p += 2
+        flush_offsets = ()
+        if has_flush:
+            n_flush = b[p]; p += 1
+            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_flush))
+            p += 4*n_flush
         try:
             name_str = name_raw.decode('utf-8') if (gpf & GPF_UTF8) else name_raw.decode('cp437')
         except Exception:
@@ -190,14 +199,33 @@ def _unpack_entries(b: bytes) -> List[Dict]:
             'policy': {
                 'use_data_descriptor': bool(use_dd),
                 'dd_has_signature': bool(dd_sig),
+                'flush_offsets': flush_offsets,
             },
         })
     return entries
 
-def _compress_raw_deflate(data: bytes, level: int, memlevel: int) -> bytes:
-    co = zlib.compressobj(level=level, method=zlib.DEFLATED, wbits=-15,
-                          memLevel=memlevel)
-    return co.compress(data) + co.flush(zlib.Z_FINISH)
+COMPRESSION_PROFILES: List[Dict] = [
+    {'name': 'python-docx', 'kind': 'zlib', 'level': 6, 'memlevel': 8},
+    {'name': 'msword',      'kind': 'msword'},
+] + [
+    {'name': f'aspose-ml#{ml}', 'kind': 'zlib', 'level': 5, 'memlevel': ml}
+    for ml in range(1, 10)
+]
+
+
+def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = ()) -> bytes:
+    """
+    Raw DEFLATE for one entry, per the given compression profile.
+    `flush_offsets` is honoured only by producers that split parts (MS Word).
+    """
+    kind = profile['kind']
+    if kind == 'zlib':
+        co = zlib.compressobj(level=profile['level'], method=zlib.DEFLATED,
+                              wbits=-15, memLevel=profile['memlevel'])
+        return co.compress(data) + co.flush(zlib.Z_FINISH)
+    if kind == 'msword':
+        return msword_compressor.compress_raw_deflate_msword(data, flush_offsets)
+    raise ValueError(f'Unknown compression profile kind: {kind}')
 
 def _parse_metadata(metadata_line: str) -> List[Dict]:
     parts = metadata_line.split()
@@ -211,12 +239,13 @@ def _parse_metadata(metadata_line: str) -> List[Dict]:
     return _unpack_entries(blob)
 
 def build_docx_bytes(input_dir: Path, metadata_line: str,
-                     level: int = 6, memlevel: int = 8) -> bytes:
+                     profile: Dict = None) -> bytes:
     """
     Build a DOCX archive in-memory from uncompressed files and metadata,
     using the given zlib parameters for DEFLATE entries.
     """
     entries = _parse_metadata(metadata_line)
+    profile = profile or COMPRESSION_PROFILES[0]
 
     out = io.BytesIO()
     cd_records: List[bytes] = []
@@ -243,7 +272,7 @@ def build_docx_bytes(input_dir: Path, metadata_line: str,
         if lfh['method'] == METHOD_STORE:
             comp = raw
         elif lfh['method'] == METHOD_DEFLATE:
-            comp = _compress_raw_deflate(raw, level=level, memlevel=memlevel)
+            comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()))
         else:
             raise ValueError(f'Unsupported method {lfh["method"]} for {name_str}')
 
@@ -361,32 +390,33 @@ def extract_tree(repo, tree, path: Path):
 
 def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str) -> Tuple[bytes, str, dict]:
     """
-    Deterministically recompress docx from pointer file metadata.
-    Try default parameters first; if whole-archive SHA256 != expected, try Aspose-like fallback
-    with level=5 and memLevel in 1..9. Return (docx_bytes, matched_profile, meta).
-    matched_profile is "default", "aspose-ml#<n>", or "none".
-    meta contains auxiliary info useful for logs.
+    Deterministically recompress docx from pointer file metadata by trying each
+    entry of COMPRESSION_PROFILES until the whole-archive SHA256 matches.
+    Return (docx_bytes, matched_profile_name, meta); the name is "none" when
+    nothing reproduced the original, in which case the bytes are best-effort.
     """
-    # 1) Default - python-docx
-    default_level, default_mem = 6, 8
-    docx_bytes = build_docx_bytes(input_dir, metadata_line, level=default_level, memlevel=default_mem)
-    sha = calculate_sha256(docx_bytes)
-    logging.info(f"Default build SHA256={sha}")
-    if expected_hash and sha == expected_hash:
-        logging.info("Default build matched expected hash.")
-        return docx_bytes, "default", {"level": default_level, "memLevel": default_mem, "sha": sha}
+    fallback = None
+    for profile in COMPRESSION_PROFILES:
+        try:
+            docx_bytes = build_docx_bytes(input_dir, metadata_line, profile=profile)
+        except Exception as e:
+            logging.warning(f"Profile {profile['name']} raised: {e}")
+            continue
+        sha = calculate_sha256(docx_bytes)
+        logging.info(f"Profile {profile['name']} SHA256={sha}")
+        meta = {"profile": profile, "level": profile.get("level"),
+                "memLevel": profile.get("memlevel"), "sha": sha}
+        if expected_hash and sha == expected_hash:
+            logging.info(f"Profile {profile['name']} matched expected hash.")
+            return docx_bytes, profile["name"], meta
+        if fallback is None:
+            fallback = (docx_bytes, meta)
 
-    # 2) Aspose-like fallback
-    for ml in range(1, 10):
-        docx_bytes_ml = build_docx_bytes(input_dir, metadata_line, level=5, memlevel=ml)
-        sha_ml = calculate_sha256(docx_bytes_ml)
-        logging.info(f"Aspose-like build memLevel={ml} SHA256={sha_ml}")
-        if expected_hash and sha_ml == expected_hash:
-            logging.info(f"Aspose-like memLevel={ml} matched expected hash.")
-            return docx_bytes_ml, f"aspose-ml#{ml}", {"level": 5, "memLevel": ml, "sha": sha_ml}
+    logging.warning("No recompression profile matched the expected hash; emitting best effort.")
+    if fallback is None:
+        return b"", "none", {"profile": None, "level": None, "memLevel": None, "sha": ""}
+    return fallback[0], "none", fallback[1]
 
-    logging.warning("No recompression profile matched the expected hash; emitting default build.")
-    return docx_bytes, "none", {"level": default_level, "memLevel": default_mem, "sha": sha}
 
 def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
     """
@@ -427,6 +457,8 @@ def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
             logging.error(f"Hash mismatch. Expected: {expected_hash}, Got: {meta['sha']} (profile={profile})")
         else:
             logging.info("Hash matched expected.")
+            # Debug printout to console; stderr because stdout carries the docx bytes.
+            sys.stderr.write(f"[docx smudge] {refname}: profile={profile}\n")
         # Write result to stdout
         sys.stdout.buffer.write(docx_bytes)
 

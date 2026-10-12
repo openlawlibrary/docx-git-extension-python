@@ -47,6 +47,7 @@ import tempfile
 import zipfile
 import pygit2
 import logging
+import msword_compressor
 from utils.utils import (read_u16, read_u32, encode_b85, calculate_sha256, repo_from_cwd, calculate_file_sha256)
 
 # === ZIP constants ===
@@ -61,7 +62,8 @@ GPF_UTF8            = 0x0800
 
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
-META_MAGIC = b"DM3\x00"
+META_MAGIC_V3 = b"DM3\x00"   # no flush offsets; written when no entry needs them
+META_MAGIC = b"DM4\x00"
 
 log_path = Path.cwd() / "docx_clean.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
@@ -184,7 +186,7 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
     """
     Extract metadata for all xml entries.
     """
-    recs: List[bytes] = []
+    recs: List[Tuple[bytes, Tuple[int, ...]]] = []
     for c in iterate_cd_entries(buf, cd_off, cd_size):
         lfh = parse_lfh(buf, c['lfh_rel_off'])
         # data descriptor policy detection
@@ -200,6 +202,16 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
         extra_lfh = lfh['extra_raw']
         extra_cd  = c['extra_raw']
         comment   = c['comment_raw']
+        # Word can hand the packager one part in several pieces, flushing between
+        # them; the boundaries are content-dependent, so record rather than guess.
+        flush_offsets = ()
+        if lfh['method'] == METHOD_DEFLATE and not is_dir:
+            comp_len = c['comp_size'] if lfh['comp_size'] == 0 else lfh['comp_size']
+            try:
+                flush_offsets = msword_compressor.detect_flush_offsets(
+                    buf[lfh['data_off']:lfh['data_off'] + comp_len])
+            except Exception as e:
+                logging.warning(f"flush-offset scan failed for {c['name']}: {e}")
         rec = [
             struct.pack('<H', len(name)), name,
             struct.pack('<B', is_dir),
@@ -211,13 +223,24 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
             struct.pack('<H', len(comment)), comment,
             struct.pack('<BB', use_dd, dd_has_sig),
         ]
-        recs.append(b''.join(rec))
+        recs.append((b''.join(rec), tuple(flush_offsets)))
+
+    # Only use DM4 when some entry actually has flush offsets. Otherwise keep
+    # writing DM3, so pointers committed before DM4 existed re-clean to the same
+    # bytes and git doesn't report every such docx as modified.
+    has_flush = any(offsets for _, offsets in recs)
     header = b''.join([
-        META_MAGIC,
+        META_MAGIC if has_flush else META_MAGIC_V3,
         struct.pack('<I', len(recs)),
         struct.pack('<I', 0),  # global flags: zip64 bit0 = 0
     ])
-    return header + b''.join(recs)
+    body = []
+    for rec, offsets in recs:
+        body.append(rec)
+        if has_flush:
+            body.append(struct.pack('<B', len(offsets)))
+            body.append(b''.join(struct.pack('<I', o) for o in offsets))
+    return header + b''.join(body)
 
 def dump_metadata(original: Path) -> None:
     """
