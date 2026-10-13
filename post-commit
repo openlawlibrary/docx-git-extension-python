@@ -29,6 +29,16 @@ def read_pointer_file_from_commit(repo, commit, path):
         print(f"Error reading pointer file {path}: {e}", file=sys.stderr)
         return None
 
+def parse_tree_from_pointer(pointer_text):
+    """
+    Read the parts-tree id the clean filter recorded in the pointer. Older
+    pointers have no TREE line; those fall back to the legacy side file.
+    """
+    for line in pointer_text.splitlines():
+        if line.startswith("TREE:"):
+            return line[len("TREE:"):].strip()
+    return None
+
 def parse_ref_from_pointer(pointer_text):
     """
     Read custom reference path from pointer file.
@@ -63,8 +73,13 @@ def main():
         
         # Find git tree that contains xmls:
         try:
-            tree_oid_file = Path(repo.path) / "docx-tree-oid"
-            tree_oid = tree_oid_file.read_text(encoding="utf-8").strip()
+            tree_oid = parse_tree_from_pointer(pointer_text)
+            if tree_oid is None:
+                # legacy pointer written before TREE existed
+                legacy = Path(repo.path) / "docx-tree-oid"
+                print(f"{path}: pointer has no TREE line, falling back to {legacy}",
+                      file=sys.stderr)
+                tree_oid = legacy.read_text(encoding="utf-8").strip()
             obj = repo[tree_oid]
             if obj.type_str == 'tree':
                 tree = obj

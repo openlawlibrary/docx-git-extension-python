@@ -2,8 +2,12 @@
 """
 Format of pointer-file:
     DOCX-POINTER: <refname>
+    TREE: <oid of the git tree holding the unpacked parts>
     HASH: SHA256 <hex>
     ENTRIES_BASE85 <b85> SHA256 <hex>
+
+The header lines before ENTRIES_BASE85 are parsed by key, not by position, so
+pointers written before TREE existed still smudge.
 
 Where ENTRIES_BASE85 is a base85 of a compact binary table:
   Header:
@@ -212,6 +216,11 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
                     buf[lfh['data_off']:lfh['data_off'] + comp_len])
             except Exception as e:
                 logging.warning(f"flush-offset scan failed for {c['name']}: {e}")
+        logging.debug(
+            f"entry {c['name']!r}: method={lfh['method']} dir={bool(is_dir)} "
+            f"gpf=0x{lfh['gpf']:04x} comp={c['comp_size']} uncomp={c['uncomp_size']} "
+            f"dd={use_dd}/{dd_has_sig} extra_lfh={len(extra_lfh)} extra_cd={len(extra_cd)} "
+            f"flush={flush_offsets or '-'}")
         rec = [
             struct.pack('<H', len(name)), name,
             struct.pack('<B', is_dir),
@@ -229,6 +238,9 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
     # writing DM3, so pointers committed before DM4 existed re-clean to the same
     # bytes and git doesn't report every such docx as modified.
     has_flush = any(offsets for _, offsets in recs)
+    n_flush = sum(1 for _, offsets in recs if offsets)
+    logging.info(f"Packed {len(recs)} entries, magic={'DM4' if has_flush else 'DM3'}, "
+                 f"{n_flush} entries carry flush offsets")
     header = b''.join([
         META_MAGIC if has_flush else META_MAGIC_V3,
         struct.pack('<I', len(recs)),
@@ -242,16 +254,19 @@ def _pack_entries_from_original(buf: bytes, cd_off: int, cd_size: int) -> bytes:
             body.append(b''.join(struct.pack('<I', o) for o in offsets))
     return header + b''.join(body)
 
-def dump_metadata(original: Path) -> None:
+def dump_metadata(b: bytes) -> None:
     """
-    Write xml metadata to a pointer file.
+    Write xml metadata to a pointer file. Takes the document's bytes so it
+    cannot disagree with the tree built from those same bytes.
     """
-    b = original.read_bytes()
     cd_off, cd_size = find_eocd(b)
+    logging.debug(f"EOCD: central directory at {cd_off}, {cd_size} bytes")
 
     entries_blob = _pack_entries_from_original(b, cd_off, cd_size)
     entries_b85 = encode_b85(entries_blob)
     entries_sha = calculate_sha256(entries_blob)
+    logging.info(f"Entry table: {len(entries_blob)} bytes raw, {len(entries_b85)} base85, "
+                 f"SHA256={entries_sha}")
 
     sys.stdout.write(f'ENTRIES_BASE85 {entries_b85} SHA256 {entries_sha}\n')
 
@@ -280,34 +295,65 @@ def save_docx_as_git_tree(repo, docx_bytes) -> pygit2.Oid:
         docx_path.write_bytes(docx_bytes)
 
         with zipfile.ZipFile(docx_path, "r") as zip_ref:
+            names = zip_ref.namelist()
             zip_ref.extractall(tmp_path / "unzipped")
+        logging.debug(f"Unpacked {len(names)} zip members: {', '.join(sorted(names))}")
 
         tree_builder = repo.TreeBuilder()
         add_directory_to_tree(repo, tmp_path / "unzipped", tree_builder)
-        
-        return tree_builder.write()
+
+        tree_oid = tree_builder.write()
+        logging.info(f"Stored {len(names)} parts as tree {tree_oid}")
+        return tree_oid
 
 def main():
+    logging.info("clean_filter.py started")
     if len(sys.argv) < 2:
+        logging.error("No path argument; git passes one via %f in the filter definition.")
         sys.stderr.write("Usage: clean_filter.py <path_to_docx>\n")
         sys.exit(1)
 
     docx_path = Path(sys.argv[1])
     base_name = str(docx_path.with_suffix(""))
+    logging.info(f"Cleaning {docx_path} (base name {base_name!r}) in {Path.cwd()}")
 
+    # Everything below is derived from docx_bytes - the content git actually
+    # handed us. Reading the path instead would let the tree and the entry table
+    # come from different revisions whenever the worktree file is not what is
+    # being cleaned (stash, checkout, re-add).
     docx_bytes = sys.stdin.buffer.read()
+    logging.info(f"Read {len(docx_bytes)} bytes from stdin")
+    if not docx_bytes:
+        # An empty payload would otherwise be stored as a valid pointer to an
+        # empty tree, which smudge cannot turn back into a document.
+        logging.error(f"{docx_path}: git handed us 0 bytes; refusing to write a pointer")
+        sys.stderr.write(f"clean_filter.py: {docx_path} is empty, refusing to clean\n")
+        sys.exit(1)
+
     refname = f"refs/docx/{base_name}"
+    logging.info(f"Pointer ref: {refname}")
     sys.stdout.write(f"DOCX-POINTER:{refname}\n")
     repo = repo_from_cwd()
     tree_oid = save_docx_as_git_tree(repo, docx_bytes)
-    try:
-        tree_oid_file = Path(repo.path) / "docx-tree-oid"
-        tree_oid_file.write_text(str(tree_oid) + "\n", encoding="utf-8")
-    except Exception as e:
-        logging.warning(e)
-    docx_hash = calculate_file_sha256(docx_path)
+    # Carry the tree id in the pointer: it is per-document and committed, so it
+    # cannot be raced or overwritten the way a single $GIT_DIR slot can.
+    sys.stdout.write(f"TREE:{tree_oid}\n")
+    docx_hash = calculate_sha256(docx_bytes)
+    logging.info(f"Document SHA256={docx_hash}")
     sys.stdout.write(f"HASH:{docx_hash}\n")
-    dump_metadata(docx_path)
+    dump_metadata(docx_bytes)
+    logging.info(f"Wrote pointer for {docx_path}: tree={tree_oid} hash={docx_hash}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # Exit non-zero so git aborts instead of storing the half-written pointer
+        # that is already on stdout. Staying silent here is how a document ends
+        # up committed as an unreadable pointer.
+        logging.exception(f"Unhandled exception: {e}")
+        sys.stderr.write(f"clean_filter.py: failed to clean "
+                         f"{sys.argv[1] if len(sys.argv) > 1 else '<no path>'}: {e}\n")
+        sys.exit(1)

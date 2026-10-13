@@ -465,29 +465,25 @@ def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
 def main():
     logging.info("docx_smudge_final.py started")
     # Extract refname from pointer file:
-    pointer_line = sys.stdin.readline().strip()
-    if not pointer_line.startswith("DOCX-POINTER:"):
-        logging.warning("Missing DOCX-POINTER")
-        sys.stdout.write(pointer_line + "\n")
-        sys.stdout.write(sys.stdin.read())
-        return
-    refname = pointer_line.split(":", 1)[1].strip()
+    # Parse the header tolerantly rather than assuming three lines in a fixed
+    # order: pointers gained a TREE line, and may gain more.
+    headers, metadata_line, seen = {}, None, []
+    for line in sys.stdin:
+        line = line.strip()
+        seen.append(line)
+        if line.startswith("ENTRIES_BASE85"):
+            metadata_line = line
+            break
+        if ":" in line:
+            key, value = line.split(":", 1)
+            headers[key.strip()] = value.strip()
 
-    # Extract original docx hash from pointer file:
-    hash_line = sys.stdin.readline().strip()
-    if not hash_line.startswith("HASH:"):
-        logging.warning("Missing HASH")
-        sys.stdout.write(hash_line + "\n")
+    refname = headers.get("DOCX-POINTER")
+    expected_hash = headers.get("HASH")
+    if not refname or metadata_line is None:
+        logging.warning("Malformed pointer: %r", seen[:4])
+        sys.stdout.write("\n".join(seen) + "\n")
         sys.stdout.write(sys.stdin.read())
-        return
-    expected_hash = hash_line.split(":", 1)[1].strip()
-
-    # Extract metadata from pointer file:
-    metadata_line = sys.stdin.readline().strip()
-    if not metadata_line.startswith("ENTRIES_BASE85"):
-        logging.warning("Missing ENTRIES_BASE85")
-        logging.warning(f"{metadata_line}")
-        sys.stdout.write(metadata_line + "\n")
         return
 
     try:
