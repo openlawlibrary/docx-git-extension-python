@@ -11,6 +11,8 @@ from typing import Dict, Iterable, List, Tuple
 import tempfile
 import pygit2
 import logging
+import block_breaks
+import compression_profiles
 import msword_compressor
 from utils.utils import (read_u16, read_u32, decode_b85, calculate_sha256)
 
@@ -24,7 +26,8 @@ GPF_UTF8            = 0x0800
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
 META_MAGIC_V3 = b"DM3\x00"   # pointers written before flush offsets existed
-META_MAGIC = b"DM4\x00"
+META_MAGIC_V4 = b"DM4\x00"   # per-entry Z_FULL_FLUSH offsets (Word)
+META_MAGIC = b"DM5\x00"      # per-entry (break kind, offsets)
 
 log_path = Path.cwd() / "docx_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
@@ -146,9 +149,13 @@ def parse_lfh(buf: bytes, off: int) -> Dict:
 def _unpack_entries(b: bytes) -> List[Dict]:
     p = 0
     magic = b[p:p+4]
-    if magic not in (META_MAGIC, META_MAGIC_V3):
+    if magic not in (META_MAGIC, META_MAGIC_V4, META_MAGIC_V3):
         raise ValueError('Bad meta magic')
-    has_flush = (magic == META_MAGIC)
+    # DM4 carries a bare offset count and means Z_FULL_FLUSH; DM5 carries an
+    # explicit kind first, so a stream cut with Z_BLOCK is not replayed as a
+    # flush. Getting that wrong produces a plausible stream with the wrong bytes.
+    has_kind = (magic == META_MAGIC)
+    has_flush = (magic == META_MAGIC_V4)
     p += 4
     count = read_u32(b, p); p += 4
     _global_flags = read_u32(b, p); p += 4
@@ -167,11 +174,19 @@ def _unpack_entries(b: bytes) -> List[Dict]:
         cm_len = read_u16(b, p); p += 2
         comment = b[p:p+cm_len]; p += cm_len
         use_dd = b[p]; dd_sig = b[p+1]; p += 2
-        flush_offsets = ()
-        if has_flush:
-            n_flush = b[p]; p += 1
-            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_flush))
-            p += 4*n_flush
+        break_kind, flush_offsets = compression_profiles.BREAK_NONE, ()
+        if has_kind:
+            break_kind = b[p]; n_off = b[p+1]; p += 2
+            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_off))
+            p += 4*n_off
+            if not flush_offsets:
+                break_kind = compression_profiles.BREAK_NONE
+        elif has_flush:
+            n_off = b[p]; p += 1
+            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_off))
+            p += 4*n_off
+            if flush_offsets:
+                break_kind = compression_profiles.BREAK_FULL
         try:
             name_str = name_raw.decode('utf-8') if (gpf & GPF_UTF8) else name_raw.decode('cp437')
         except Exception:
@@ -200,32 +215,26 @@ def _unpack_entries(b: bytes) -> List[Dict]:
                 'use_data_descriptor': bool(use_dd),
                 'dd_has_signature': bool(dd_sig),
                 'flush_offsets': flush_offsets,
+                'break_kind': break_kind,
             },
         })
     return entries
 
-COMPRESSION_PROFILES: List[Dict] = [
-    {'name': 'python-docx', 'kind': 'zlib', 'level': 6, 'memlevel': 8},
-    {'name': 'msword',      'kind': 'msword'},
-] + [
-    {'name': f'aspose-ml#{ml}', 'kind': 'zlib', 'level': 5, 'memlevel': ml}
-    for ml in range(1, 10)
-]
+# Single source of truth, shared with the clean filter so the two cannot drift.
+COMPRESSION_PROFILES: List[Dict] = compression_profiles.PROFILES
 
 
-def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = ()) -> bytes:
+def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = (),
+                          break_kind: int = compression_profiles.BREAK_NONE) -> bytes:
     """
     Raw DEFLATE for one entry, per the given compression profile.
-    `flush_offsets` is honoured only by producers that split parts (MS Word).
+
+    `flush_offsets` means different things depending on `break_kind`: a full
+    flush for Word's split parts, or a bare block break for packagers that cut
+    blocks with Z_BLOCK. A profile that cannot honour the kind it is handed
+    raises rather than quietly producing the wrong framing.
     """
-    kind = profile['kind']
-    if kind == 'zlib':
-        co = zlib.compressobj(level=profile['level'], method=zlib.DEFLATED,
-                              wbits=-15, memLevel=profile['memlevel'])
-        return co.compress(data) + co.flush(zlib.Z_FINISH)
-    if kind == 'msword':
-        return msword_compressor.compress_raw_deflate_msword(data, flush_offsets)
-    raise ValueError(f'Unknown compression profile kind: {kind}')
+    return compression_profiles.compress_entry(data, profile, break_kind, flush_offsets)
 
 def _parse_metadata(metadata_line: str) -> List[Dict]:
     parts = metadata_line.split()
@@ -272,7 +281,8 @@ def build_docx_bytes(input_dir: Path, metadata_line: str,
         if lfh['method'] == METHOD_STORE:
             comp = raw
         elif lfh['method'] == METHOD_DEFLATE:
-            comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()))
+            comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()),
+                                         pol.get('break_kind', compression_profiles.BREAK_NONE))
         else:
             raise ValueError(f'Unsupported method {lfh["method"]} for {name_str}')
 
@@ -388,7 +398,28 @@ def extract_tree(repo, tree, path: Path):
             full_path.write_bytes(obj.read_raw())
             logging.debug(f"Extracted file: {full_path}")
 
-def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str) -> Tuple[bytes, str, dict]:
+def _profile_order(profile_name):
+    """
+    Try the profile the clean filter recorded first, then the rest.
+
+    The recorded one is not merely a hint: block breaks are fitted against a
+    specific profile and mean nothing against another, so for a DM5 pointer this
+    is the only candidate that can work. The others still follow, because a
+    pointer naming an unknown profile should degrade to a search rather than
+    fail outright.
+    """
+    if not profile_name:
+        return COMPRESSION_PROFILES
+    named = compression_profiles.BY_NAME.get(profile_name)
+    if named is None:
+        logging.warning(f"Pointer names unknown profile {profile_name!r}; searching instead")
+        return COMPRESSION_PROFILES
+    logging.info(f"Pointer records profile {compression_profiles.describe(named)}")
+    return [named] + [p for p in COMPRESSION_PROFILES if p['name'] != profile_name]
+
+
+def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str,
+                    profile_name: str = None) -> Tuple[bytes, str, dict]:
     """
     Deterministically recompress docx from pointer file metadata by trying each
     entry of COMPRESSION_PROFILES until the whole-archive SHA256 matches.
@@ -396,7 +427,7 @@ def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str) -> 
     nothing reproduced the original, in which case the bytes are best-effort.
     """
     fallback = None
-    for profile in COMPRESSION_PROFILES:
+    for profile in _profile_order(profile_name):
         try:
             docx_bytes = build_docx_bytes(input_dir, metadata_line, profile=profile)
         except Exception as e:
@@ -418,7 +449,8 @@ def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str) -> 
     return fallback[0], "none", fallback[1]
 
 
-def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
+def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str,
+                  profile_name: str = None):
     """
     Recreate original docx from pointer file input data.
     1) Find git tree from refname.
@@ -445,7 +477,8 @@ def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str):
         extract_tree(repo, tree, tmp_path)
 
         # Compress folder to recreate the original docx:
-        docx_bytes, profile, meta = recompress_docx(tmp_path, metadata_line, expected_hash)
+        docx_bytes, profile, meta = recompress_docx(tmp_path, metadata_line, expected_hash,
+                                                    profile_name)
 
         # Log outcome
         logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
@@ -488,7 +521,7 @@ def main():
 
     try:
         repo = repo_from_cwd()
-        recreate_docx(repo, refname, expected_hash, metadata_line)
+        recreate_docx(repo, refname, expected_hash, metadata_line, headers.get("PROFILE"))
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")
         # Fail loudly: exiting 0 with empty stdout makes git write a 0-byte docx.
