@@ -25,6 +25,10 @@ GPF_DATA_DESCRIPTOR = 0x0008
 GPF_UTF8            = 0x0800
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
+# Repeated from the clean filter rather than imported: the two halves of this
+# format should not be able to break each other by one of them moving.
+POINTER_MAGIC = "DOCX-POINTER"
+
 META_MAGIC_V3 = b"DM3\x00"   # pointers written before flush offsets existed
 META_MAGIC_V4 = b"DM4\x00"   # per-entry Z_FULL_FLUSH offsets (Word)
 META_MAGIC = b"DM5\x00"      # per-entry (break kind, offsets)
@@ -449,27 +453,34 @@ def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str,
     return fallback[0], "none", fallback[1]
 
 
-def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str,
+def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
                   profile_name: str = None):
     """
-    Recreate original docx from pointer file input data.
-    1) Find git tree from refname.
-    2) Extract git tree to a temp folder.
-    3) Compress folder to recreate the original docx.
-    """
-    logging.info(f"Creating DOCX from ref '{refname}'")
-    ref = repo.references[refname]
-    obj = repo[ref.target]
+    Recreate the original document from the pointer.
 
-    # Load git tree from custom ref:
-    if isinstance(obj, pygit2.Commit):
-        tree = obj.tree
-        logging.debug(f"Resolved {refname} to commit {obj.id}")
-    elif isinstance(obj, pygit2.Tree):
+    1) Load the parts tree the pointer names, BY OID.
+    2) Extract it to a temp folder.
+    3) Recompress to reproduce the original archive.
+
+    Resolving by oid rather than by ref name is what makes checking out an older
+    commit return that commit's document. A ref holds whichever version is
+    newest, so resolving by name returns the latest parts for every revision -
+    a wrong document, delivered without an error.
+    """
+    logging.info(f"Creating document from parts tree {tree_oid}")
+    try:
+        obj = repo[tree_oid]
+    except (KeyError, ValueError) as e:
+        raise LookupError(
+            f"parts tree {tree_oid} is not in this repository ({e}). The clone may "
+            f"be missing refs/docx/*; run install.py and 'git fetch'.") from e
+
+    if isinstance(obj, pygit2.Tree):
         tree = obj
-        logging.debug(f"Resolved {refname} to tree {obj.id}")
+    elif isinstance(obj, pygit2.Commit):
+        tree = obj.tree
     else:
-        raise TypeError(f"Unsupported object type at {refname}: {type(obj)}")
+        raise TypeError(f"{tree_oid} is a {type(obj).__name__}, not a tree")
 
     # Extract git tree to a temp folder and recompress it:
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -483,20 +494,25 @@ def recreate_docx(repo, refname: str, expected_hash: str, metadata_line: str,
         # Log outcome
         logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
 
-        # If expected hash provided and still mismatched, log an error explicitly.
-        # Still emit the best-effort rebuild: writing nothing leaves a 0-byte docx in
-        # the working tree, which then breaks every later clean filter run.
+        # Refuse rather than emit. A rebuild that does not match the committed
+        # hash is a different document, and writing it puts bytes on disk that
+        # git believes are the committed ones - the worst failure available to a
+        # version control tool. Raising here exits non-zero, and git then aborts
+        # the checkout leaving no file at all, not a truncated one.
         if expected_hash and meta["sha"] != expected_hash:
             logging.error(f"Hash mismatch. Expected: {expected_hash}, Got: {meta['sha']} (profile={profile})")
-        else:
-            logging.info("Hash matched expected.")
-            # Debug printout to console; stderr because stdout carries the docx bytes.
-            sys.stderr.write(f"[docx smudge] {refname}: profile={profile}\n")
-        # Write result to stdout
+            raise ValueError(
+                f"rebuild does not match the committed hash (expected {expected_hash}, "
+                f"got {meta['sha']}, profile={profile})")
+        logging.info("Hash matched expected.")
+        # Debug printout to console; stderr because stdout carries the document.
+        sys.stderr.write(f"[docx smudge] tree {tree_oid[:12]}: profile={profile}\n")
         sys.stdout.buffer.write(docx_bytes)
 
 def main():
     logging.info("docx_smudge_final.py started")
+    path = sys.argv[1] if len(sys.argv) > 1 else "<unknown>"
+    logging.info(f"Smudging document: {path}")
     # Extract refname from pointer file:
     # Parse the header tolerantly rather than assuming three lines in a fixed
     # order: pointers gained a TREE line, and may gain more.
@@ -511,21 +527,33 @@ def main():
             key, value = line.split(":", 1)
             headers[key.strip()] = value.strip()
 
-    refname = headers.get("DOCX-POINTER")
-    expected_hash = headers.get("HASH")
-    if not refname or metadata_line is None:
-        logging.warning("Malformed pointer: %r", seen[:4])
-        sys.stdout.write("\n".join(seen) + "\n")
+    # Anything that is not one of our pointers passes through untouched. git
+    # applies this filter to every path .gitattributes matches, and mangling a
+    # file we do not recognise would be worse than doing nothing.
+    if not seen or not seen[0].startswith(POINTER_MAGIC):
+        logging.warning("Not a docx pointer; passing through: %r", seen[:1])
+        if seen:
+            sys.stdout.write("\n".join(seen) + "\n")
         sys.stdout.write(sys.stdin.read())
         return
 
+    tree_oid = headers.get("TREE")
+    expected_hash = headers.get("HASH")
+    if not tree_oid or metadata_line is None:
+        logging.error("Malformed pointer: %r", seen[:4])
+        sys.stderr.write("smudge_filter.py: pointer has no TREE or no entry table\n")
+        sys.exit(1)
+
     try:
         repo = repo_from_cwd()
-        recreate_docx(repo, refname, expected_hash, metadata_line, headers.get("PROFILE"))
+        recreate_docx(repo, tree_oid, expected_hash, metadata_line, headers.get("PROFILE"))
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")
-        # Fail loudly: exiting 0 with empty stdout makes git write a 0-byte docx.
-        sys.stderr.write(f"smudge_filter.py: failed to recreate docx from '{refname}': {e}\n")
+        # Fail loudly. Exiting 0 with nothing on stdout makes git write a 0-byte
+        # document; exiting non-zero makes git abort the checkout and write no
+        # file at all, which is the only honest outcome when the bytes we would
+        # produce are not the bytes that were committed.
+        sys.stderr.write(f"smudge_filter.py: failed to recreate {path}: {e}\n")
         sys.exit(1)
 
 if __name__ == "__main__":

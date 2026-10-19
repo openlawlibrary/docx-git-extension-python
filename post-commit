@@ -3,6 +3,56 @@ import pygit2
 from pathlib import Path
 import sys
 
+import hashlib
+
+# This hook is DELIBERATELY SELF-CONTAINED: pygit2 and the standard library,
+# nothing from the rest of the extension. Git copies hooks into .git/hooks/,
+# where an import of a sibling module resolves against the wrong directory and
+# fails at commit time. Being standalone means `cp post-commit .git/hooks/`
+# just works, with no shim and no sys.path games.
+#
+# The two constants below are repeated from the clean filter rather than
+# imported. They are format constants, and a format change touches all three
+# components anyway; a shared module would only trade that for an import that
+# breaks when the hook is copied.
+POINTER_MAGIC = b"DOCX-POINTER"
+REF_NAMESPACE = "refs/docx"
+
+# A pointer is a few hundred bytes to a few kilobytes. The cap keeps this hook
+# from reading a 30 MB asset just to decide it is not one of ours.
+MAX_POINTER_BYTES = 1 << 20
+
+
+def ref_for(path):
+    """
+    The ref holding this document's parts: refs/docx/<sha256 of the path>.
+
+    Hashed, not encoded. Git ref names cannot hold arbitrary paths - space,
+    ~ ^ : ? * [ \\ and controls are all legal in a filename and illegal in a
+    ref, and refs further reject a leading dot, a trailing dot, a component
+    ending .lock, and `..` anywhere. Encoding around that is a module of string
+    rules; base64 or base32 of the path is legal but collapses the path into
+    one name component, which a filesystem caps at 255 bytes (base32 breaks
+    past ~155 characters of path, base64url past ~190) and fails as a refused
+    update-ref at commit time.
+
+    A hash is fixed length, always legal, and one line. Nothing needs to read
+    the name back out: the smudge filter resolves the parts tree from the
+    pointer's TREE line and never consults a ref. The cost is that
+    `git for-each-ref refs/docx` is opaque - to find a document's ref you hash
+    its path rather than read the listing.
+
+    sha256 because the pointer already uses it for HASH and the entry table:
+    one hash primitive in the codebase.
+
+    Renaming a document produces a new ref; the old one keeps pointing at the
+    old chain, so earlier versions stay reachable and the stale ref lingers.
+    """
+    if not path:
+        raise ValueError("empty path has no ref name")
+    digest = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()
+    return "%s/%s" % (REF_NAMESPACE, digest)
+
 def get_modified_docx_files(commit):
     """
     Return a list of modified docx files for current commit.
@@ -15,10 +65,29 @@ def get_modified_docx_files(commit):
 
     modified = []
     for patch in diff:
-        path = patch.delta.new_file.path
-        if path.endswith('.docx') and patch.delta.status_char() in ('A', 'M'):
-            modified.append(path)
+        if patch.delta.status_char() in ('A', 'M'):
+            modified.append(patch.delta.new_file.path)
     return modified
+
+
+def is_pointer(repo, commit, path):
+    """
+    True when the blob committed at `path` is one of our pointers.
+
+    Asking the data beats keeping a list of extensions in step with
+    .gitattributes by hand. A path routed through the filter but missing from
+    such a list is cleaned into a pointer whose ref is never created, and the
+    document becomes impossible to check out - which is exactly what happened
+    the first time .odt was enabled. This way .gitattributes is the only place
+    a format is turned on.
+    """
+    try:
+        blob = repo[commit.tree[path].id]
+    except (KeyError, TypeError):
+        return False
+    if getattr(blob, 'is_binary', False) or blob.size > MAX_POINTER_BYTES:
+        return False
+    return blob.data[:len(POINTER_MAGIC)] == POINTER_MAGIC
 
 def read_pointer_file_from_commit(repo, commit, path):
     try:
@@ -41,7 +110,8 @@ def parse_tree_from_pointer(pointer_text):
 
 def parse_ref_from_pointer(pointer_text):
     """
-    Read custom reference path from pointer file.
+    Deprecated. Older pointers carried the ref name; current ones derive it from
+    the document's path instead, so there is only one source for that fact.
     """
     for line in pointer_text.splitlines():
         if line.startswith("DOCX-POINTER:"):
@@ -55,21 +125,24 @@ def main():
     # Check if there are any modified or added docx files:
     modified_files = get_modified_docx_files(commit)
     if not modified_files:
-        print("No .docx files added or modified in last commit.", file=sys.stderr)
+        print("No documents added or modified in last commit.", file=sys.stderr)
         return
 
     for path in modified_files:
+        if not is_pointer(repo, commit, path):
+            continue
         print(f"Processing {path}...", file=sys.stderr)
         # Read pointer file:
         pointer_text = read_pointer_file_from_commit(repo, commit, path)
         if not pointer_text:
             continue
         
-        # Find ref path:
-        refname = parse_ref_from_pointer(pointer_text)
-        if not refname:
-            print(f"No DOCX-POINTER ref found in {path}", file=sys.stderr)
-            continue
+        # The ref name is the hash of the document's own path. It is derived
+        # here rather than read from the pointer so there is a single source
+        # for it, and hashed so that no filename - a space, a leading dot, a
+        # .lock component, 300 characters of nested directories - can produce
+        # a ref git refuses. See ref_for above.
+        refname = ref_for(path)
         
         # Find git tree that contains xmls:
         try:
@@ -92,15 +165,16 @@ def main():
             print(f"Error resolving tree from ref {refname}, object type = {obj.type}, tree = {pygit2.Tree.type}, commit = {pygit2.Commit.type}: {e}", file=sys.stderr)
             continue
         
-        # Use HEAD commit as parent:
-        try:
-            head_commit = repo.revparse_single("HEAD")
-            if head_commit.type != 1:
-                raise TypeError("HEAD is not a commit")
-            parents = [head_commit.id]
-        except Exception as e:
-            print(f"No valid HEAD commit found: {e}", file=sys.stderr)
-            parents = []
+        # Chain onto this document's previous version, never onto the branch
+        # head. A commit parented on the branch becomes unreachable the moment
+        # this ref moves on, and its parts tree is collected at the next gc -
+        # which is why checking out an older revision used to hand back the
+        # newest document instead of the committed one.
+        #
+        # The chain is an append-only log for reachability, not a mirror of
+        # branch topology: a commit made on a side branch still chains onto
+        # whatever this ref held at the time.
+        parents = [repo.references[refname].target] if refname in repo.references else []
 
         # Create commit (commit-tree functionallity):
         author = pygit2.Signature("user", "user@mail.com")

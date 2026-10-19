@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
 Format of pointer-file:
-    DOCX-POINTER: <refname>
-    TREE: <oid of the git tree holding the unpacked parts>
-    HASH: SHA256 <hex>
+    DOCX-POINTER <human-readable notice>      <- magic; identifies the file
+    TREE:<oid of the git tree holding the unpacked parts>
+    HASH:<sha256 of the original document>
+    PROFILE:<compression profile name>        <- only when one was needed
     ENTRIES_BASE85 <b85> SHA256 <hex>
 
-The header lines before ENTRIES_BASE85 are parsed by key, not by position, so
-pointers written before TREE existed still smudge.
+TREE is authoritative. The smudge filter resolves that oid directly and never
+looks up a ref: a ref holds whichever version is newest, so resolving by name
+hands back the wrong document for every commit except the latest.
+
+There is deliberately no refname in here. It would only restate what the ref
+naming already derives from the file's own path (see ref_names.py), and two
+sources for one fact is how they drift apart.
+
+The header lines before ENTRIES_BASE85 are parsed by key rather than position,
+so a new field can be added without disturbing the readers of the old ones.
 
 Where ENTRIES_BASE85 is a base85 of a compact binary table:
   Header:
@@ -76,6 +85,16 @@ META_MAGIC = b"DM5\x00"      # per-entry (break kind, offsets)
 # Always write the OLDEST magic that can express this document. A pointer whose
 # bytes change for no reason makes git report every docx as modified the day a
 # new field ships, so DM5 appears only when some entry actually needs it.
+
+# The pointer's first line. POINTER_MAGIC identifies the file as ours; the
+# smudge filter and the post-commit hook each repeat this one string rather
+# than import it, so none of the three can break the others by being absent,
+# edited or moved. It is a format constant - if it ever changes, it changes in
+# the pointer format, and all three have to be revisited anyway.
+POINTER_MAGIC = "DOCX-POINTER"
+POINTER_NOTICE = ("placeholder - this repository stores documents unpacked; "
+                  "run the docx extension's install step here, then "
+                  "'git checkout -- .' to get the real file")
 
 log_path = Path.cwd() / "docx_clean.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
@@ -487,8 +506,7 @@ def main():
         sys.exit(1)
 
     docx_path = Path(sys.argv[1])
-    base_name = str(docx_path.with_suffix(""))
-    logging.info(f"Cleaning {docx_path} (base name {base_name!r}) in {Path.cwd()}")
+    logging.info(f"Cleaning {docx_path} in {Path.cwd()}")
 
     # Everything below is derived from docx_bytes - the content git actually
     # handed us. Reading the path instead would let the tree and the entry table
@@ -503,16 +521,21 @@ def main():
         sys.stderr.write(f"clean_filter.py: {docx_path} is empty, refusing to clean\n")
         sys.exit(1)
 
-    refname = f"refs/docx/{base_name}"
-    logging.info(f"Pointer ref: {refname}")
-    sys.stdout.write(f"DOCX-POINTER:{refname}\n")
     repo = repo_from_cwd()
     tree_oid = save_docx_as_git_tree(repo, docx_bytes)
-    # Carry the tree id in the pointer: it is per-document and committed, so it
-    # cannot be raced or overwritten the way a single $GIT_DIR slot can.
-    sys.stdout.write(f"TREE:{tree_oid}\n")
     docx_hash = calculate_sha256(docx_bytes)
-    logging.info(f"Document SHA256={docx_hash}")
+    logging.info(f"Document SHA256={docx_hash}, parts tree {tree_oid}")
+
+    # First line doubles as the magic the post-commit hook recognises and as a
+    # message for whoever opens this file in a clone that has not run install.py
+    # - without the filter configured, git writes these bytes into the worktree
+    # under the document's own name, and a bare "DOCX-POINTER:" told them
+    # nothing about what to do next.
+    sys.stdout.write(f"{POINTER_MAGIC} {POINTER_NOTICE}\n")
+    # The parts tree, named by content. Smudge resolves THIS, never a ref: a ref
+    # always holds the newest version, so resolving by name silently returns the
+    # wrong document for every commit but the latest.
+    sys.stdout.write(f"TREE:{tree_oid}\n")
     sys.stdout.write(f"HASH:{docx_hash}\n")
     dump_metadata(docx_bytes)
     logging.info(f"Wrote pointer for {docx_path}: tree={tree_oid} hash={docx_hash}")
