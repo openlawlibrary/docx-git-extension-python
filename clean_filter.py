@@ -521,6 +521,21 @@ def main():
         sys.stderr.write(f"clean_filter.py: {docx_path} is empty, refusing to clean\n")
         sys.exit(1)
 
+    if docx_bytes[:len(POINTER_MAGIC)] == POINTER_MAGIC.encode():
+        # The worktree holds a pointer rather than a document, so a checkout
+        # wrote the stored bytes straight to disk - the smudge filter was not
+        # configured, or it failed and filter.docx.required was not set.
+        # Cleaning this would store a pointer to a pointer; the document is not
+        # here to be stored. Say so, because the generic "not a zip file" sends
+        # people to inspect a document that was never the problem.
+        logging.error(f"{docx_path}: worktree file is a pointer, not a document")
+        sys.stderr.write(
+            f"clean_filter.py: {docx_path} contains pointer text, not a document."
+            f"  A checkout wrote the pointer to disk, which means the smudge filter"
+            f"  did not run.\nRestore the file with:\n"
+            f"      rm -f {docx_path!s} && git checkout -- {docx_path!s}\n")
+        sys.exit(1)
+
     repo = repo_from_cwd()
     tree_oid = save_docx_as_git_tree(repo, docx_bytes)
     docx_hash = calculate_sha256(docx_bytes)

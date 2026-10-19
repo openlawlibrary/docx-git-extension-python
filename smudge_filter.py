@@ -454,7 +454,7 @@ def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str,
 
 
 def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
-                  profile_name: str = None):
+                  profile_name: str = None, path: str = "<unknown>"):
     """
     Recreate the original document from the pointer.
 
@@ -504,22 +504,33 @@ def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
             raise ValueError(
                 f"rebuild does not match the committed hash (expected {expected_hash}, "
                 f"got {meta['sha']}, profile={profile})")
-        logging.info("Hash matched expected.")
+        # Report the document by the name the user knows it by. The tree oid is
+        # in the log for anyone who needs it; on a corpus run a screen of hashes
+        # tells you nothing about which file just went past.
+        logging.info(f"Smudged {path}: profile={profile}, tree={tree_oid}")
         # Debug printout to console; stderr because stdout carries the document.
-        sys.stderr.write(f"[docx smudge] tree {tree_oid[:12]}: profile={profile}\n")
+        sys.stderr.write(f"[docx smudge] {path}: profile={profile}\n")
         sys.stdout.buffer.write(docx_bytes)
 
 def main():
-    logging.info("docx_smudge_final.py started")
     path = sys.argv[1] if len(sys.argv) > 1 else "<unknown>"
     logging.info(f"Smudging document: {path}")
-    # Extract refname from pointer file:
-    # Parse the header tolerantly rather than assuming three lines in a fixed
-    # order: pointers gained a TREE line, and may gain more.
-    headers, metadata_line, seen = {}, None, []
-    for line in sys.stdin:
-        line = line.strip()
-        seen.append(line)
+
+    # Read as BYTES and decide on the raw prefix. Git applies this filter to
+    # every path .gitattributes matches, which includes files committed BEFORE
+    # the attribute existed - those blobs are whole documents, not pointers.
+    # An earlier version of this read stdin in text mode and reassembled the
+    # lines. Anything that is not one of our pointers must be copied through
+    # byte for byte.
+    data = sys.stdin.buffer.read()
+    if not data.startswith(POINTER_MAGIC.encode("ascii")):
+        logging.info("Not a docx pointer (%d bytes); passing through unchanged", len(data))
+        sys.stdout.buffer.write(data)
+        return
+
+    headers, metadata_line = {}, None
+    for raw in data.decode("utf-8", "replace").splitlines():
+        line = raw.strip()
         if line.startswith("ENTRIES_BASE85"):
             metadata_line = line
             break
@@ -527,26 +538,17 @@ def main():
             key, value = line.split(":", 1)
             headers[key.strip()] = value.strip()
 
-    # Anything that is not one of our pointers passes through untouched. git
-    # applies this filter to every path .gitattributes matches, and mangling a
-    # file we do not recognise would be worse than doing nothing.
-    if not seen or not seen[0].startswith(POINTER_MAGIC):
-        logging.warning("Not a docx pointer; passing through: %r", seen[:1])
-        if seen:
-            sys.stdout.write("\n".join(seen) + "\n")
-        sys.stdout.write(sys.stdin.read())
-        return
-
     tree_oid = headers.get("TREE")
     expected_hash = headers.get("HASH")
     if not tree_oid or metadata_line is None:
-        logging.error("Malformed pointer: %r", seen[:4])
+        logging.error("Malformed pointer: %r", data[:120])
         sys.stderr.write("smudge_filter.py: pointer has no TREE or no entry table\n")
         sys.exit(1)
 
     try:
         repo = repo_from_cwd()
-        recreate_docx(repo, tree_oid, expected_hash, metadata_line, headers.get("PROFILE"))
+        recreate_docx(repo, tree_oid, expected_hash, metadata_line,
+                      headers.get("PROFILE"), path)
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")
         # Fail loudly. Exiting 0 with nothing on stdout makes git write a 0-byte
