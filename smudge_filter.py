@@ -14,6 +14,7 @@ import logging
 import block_breaks
 import compression_profiles
 import msword_compressor
+import lfs_parts
 from utils.utils import (read_u16, read_u32, decode_b85, calculate_sha256)
 
 SIG_LFH   = 0x04034B50
@@ -386,21 +387,39 @@ def repo_from_cwd():
     logging.debug(f"Opened repo at {repo.path}")
     return repo
 
-def extract_tree(repo, tree, path: Path):
+def extract_tree(repo, tree, path: Path, _pending=None):
     """
     Extract xml files from a git tree to a specified path.
+
+    A blob that is an LFS pointer is a part kept in LFS (see lfs_parts.py). Those
+    are collected while walking and resolved together at the end, so that the
+    ones missing locally are fetched in one parallel batch rather than one at a
+    time in tree order.
     """
+    top = _pending is None
+    pending = {} if top else _pending
     path.mkdir(parents=True, exist_ok=True)
     logging.debug(f"Extracting tree to {path}")
     for entry in tree:
         full_path = path / entry.name
         obj = repo[entry.id]
         if entry.filemode == pygit2.GIT_FILEMODE_TREE:
-            extract_tree(repo, obj, full_path)
+            extract_tree(repo, obj, full_path, pending)
         else:
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_bytes(obj.read_raw())
+            data = obj.read_raw()
+            ptr = lfs_parts.parse_pointer(data)
+            if ptr is not None:
+                pending.setdefault(ptr, []).append(full_path)
+                continue
+            full_path.write_bytes(data)
             logging.debug(f"Extracted file: {full_path}")
+    if top and pending:
+        contents = lfs_parts.resolve_all(repo, {oid: size for oid, size in pending})
+        for (oid, _size), paths in pending.items():
+            for p in paths:
+                p.write_bytes(contents[oid])
+                logging.debug(f"Extracted LFS part: {p} ({oid})")
 
 def _profile_order(profile_name):
     """

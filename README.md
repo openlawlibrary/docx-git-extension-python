@@ -19,6 +19,21 @@ The extension contains a set of python scripts that are embedded into git workfl
 - smudge filter script
 - post-commit hook script
 
+## Images in Git LFS
+Document parts can be kept in Git LFS instead of the git object store. It is opt-in per document path, with an attribute next to the filter:
+
+```
+*.docx filter=docx docx-lfs=jpg,jpeg
+```
+
+The value lists part extensions (a bare `docx-lfs` means `jpg,jpeg`). Without it nothing changes - pointers stay byte-identical to before.
+
+- **clean** writes each matching part to the local LFS store (`.git/lfs/objects`) and puts the standard three-line LFS pointer in the parts tree. No `git lfs` process is started.
+- **smudge** reads pointers back from the local store and fetches only missing objects, through `git lfs smudge`, several at a time. Endpoint and credentials come from `.lfsconfig` and your credential helper as usual.
+- **push** needs nothing extra: `git lfs pre-push` scans the pushed `refs/docx/*` commits and uploads the images. Use a plain `git push` so the configured refspecs (`HEAD`, `refs/docx/*`) are pushed together.
+
+In a fresh clone, `git lfs fetch --all origin` after fetching `refs/docx/*` downloads every image in one batch before checkout; otherwise smudge downloads what it needs on demand. See `lfs_parts.py` for details.
+
 ## Upcoming work
 - Implementation of less-performant solution as a fallback for unsupported compressors
 - Implementation of MS Office compressor

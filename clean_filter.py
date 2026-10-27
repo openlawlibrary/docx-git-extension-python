@@ -64,6 +64,7 @@ import zlib
 import block_breaks
 import compression_profiles
 import msword_compressor
+import lfs_parts
 from utils.utils import (read_u16, read_u32, encode_b85, calculate_sha256, repo_from_cwd, calculate_file_sha256)
 
 # === ZIP constants ===
@@ -462,21 +463,26 @@ def dump_metadata(b: bytes) -> None:
         sys.stdout.write(f'PROFILE:{profile_name}\n')
     sys.stdout.write(f'ENTRIES_BASE85 {entries_b85} SHA256 {entries_sha}\n')
 
-def add_directory_to_tree(repo, base_path, tree_builder):
+def add_directory_to_tree(repo, base_path, tree_builder, lfs_extensions=frozenset()):
     """
     Create a git tree from a directory.
+
+    Parts whose extension is in `lfs_extensions` go to the local LFS store and
+    the tree holds their LFS pointer instead; see lfs_parts.py.
     """
     for entry in sorted(base_path.iterdir()):
         if entry.is_file():
-            blob_oid = repo.create_blob(entry.read_bytes())
+            data = lfs_parts.blob_for_part(repo, entry.name, entry.read_bytes(),
+                                           lfs_extensions)
+            blob_oid = repo.create_blob(data)
             tree_builder.insert(entry.name, blob_oid, pygit2.GIT_FILEMODE_BLOB)
         elif entry.is_dir():
             sub_builder = repo.TreeBuilder()
-            add_directory_to_tree(repo, entry, sub_builder)
+            add_directory_to_tree(repo, entry, sub_builder, lfs_extensions)
             subtree_oid = sub_builder.write()
             tree_builder.insert(entry.name, subtree_oid, pygit2.GIT_FILEMODE_TREE)
 
-def save_docx_as_git_tree(repo, docx_bytes) -> pygit2.Oid:
+def save_docx_as_git_tree(repo, docx_bytes, lfs_extensions=frozenset()) -> pygit2.Oid:
     """
     Unzip a docx file and store its xml components in a git tree.
     Retruns git tree oid.
@@ -492,7 +498,7 @@ def save_docx_as_git_tree(repo, docx_bytes) -> pygit2.Oid:
         logging.debug(f"Unpacked {len(names)} zip members: {', '.join(sorted(names))}")
 
         tree_builder = repo.TreeBuilder()
-        add_directory_to_tree(repo, tmp_path / "unzipped", tree_builder)
+        add_directory_to_tree(repo, tmp_path / "unzipped", tree_builder, lfs_extensions)
 
         tree_oid = tree_builder.write()
         logging.info(f"Stored {len(names)} parts as tree {tree_oid}")
@@ -537,7 +543,12 @@ def main():
         sys.exit(1)
 
     repo = repo_from_cwd()
-    tree_oid = save_docx_as_git_tree(repo, docx_bytes)
+    # Which parts go to LFS is a property of the document's path, set in
+    # .gitattributes (docx-lfs=jpg,jpeg). Unset means none, as before.
+    lfs_extensions = lfs_parts.extensions_for(repo, str(docx_path).replace("\\", "/"))
+    if lfs_extensions:
+        logging.info(f"Parts with extensions {sorted(lfs_extensions)} go to LFS")
+    tree_oid = save_docx_as_git_tree(repo, docx_bytes, lfs_extensions)
     docx_hash = calculate_sha256(docx_bytes)
     logging.info(f"Document SHA256={docx_hash}, parts tree {tree_oid}")
 
