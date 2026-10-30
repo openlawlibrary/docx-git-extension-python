@@ -1,0 +1,23 @@
+[package]
+name = "docx-preflate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Fallback compression for the docx git extension: split deflate streams into plain data + preflate-rs corrections, and recreate them byte for byte"
+license = "Apache-2.0"
+
+[[bin]]
+name = "docx-preflate"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned exactly. The corrections format is not stable across preflate-rs
+# releases, and every pointer that uses the fallback records this version
+# (FALLBACK preflate-rs/<version>). Changing it means old pointers need the old
+# helper - keep PREFLATE_VERSION in src/main.rs equal to this.
+preflate-rs = "=0.7.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

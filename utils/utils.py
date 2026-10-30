@@ -1,5 +1,4 @@
 import struct
-import base64
 import hashlib
 import pygit2
 from pathlib import Path
@@ -9,12 +8,6 @@ def read_u16(b: bytes, off: int) -> int:
 
 def read_u32(b: bytes, off: int) -> int:
     return struct.unpack_from('<I', b, off)[0]
-
-def encode_b85(b: bytes) -> str:
-    return base64.a85encode(b, adobe=False, wrapcol=0).decode('ascii')
-
-def decode_b85(s: str) -> bytes:
-    return base64.a85decode(s.encode('ascii'), adobe=False)
 
 def repo_from_cwd():
     return pygit2.Repository(pygit2.discover_repository(Path.cwd()))

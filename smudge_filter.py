@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+Smudge filter: turn a pointer back into the original document.
+
+Reads the pointer (pointer_format.py), extracts the parts tree it names,
+recompresses every entry with the one profile the pointer records and refuses
+the result unless its SHA-256 matches the pointer's HASH.
 """
 from __future__ import annotations
 import io
@@ -7,227 +12,27 @@ from pathlib import Path
 import struct
 import sys
 import zlib
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 import tempfile
 import pygit2
 import logging
-import block_breaks
 import compression_profiles
 import msword_compressor
 import lfs_parts
-from utils.utils import (read_u16, read_u32, decode_b85, calculate_sha256)
+import pointer_format
+import preflate_fallback
+from utils.utils import calculate_sha256
 
+# Smudge only writes zips; reading them is the clean filter's job.
 SIG_LFH   = 0x04034B50
 SIG_CFH   = 0x02014B50
 SIG_EOCD  = 0x06054B50
 SIG_DD    = 0x08074B50
-GPF_ENCRYPTED       = 0x0001
-GPF_DATA_DESCRIPTOR = 0x0008
-GPF_UTF8            = 0x0800
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
-# Repeated from the clean filter rather than imported: the two halves of this
-# format should not be able to break each other by one of them moving.
-POINTER_MAGIC = "DOCX-POINTER"
-
-META_MAGIC_V3 = b"DM3\x00"   # pointers written before flush offsets existed
-META_MAGIC_V4 = b"DM4\x00"   # per-entry Z_FULL_FLUSH offsets (Word)
-META_MAGIC = b"DM5\x00"      # per-entry (break kind, offsets)
 
 log_path = Path.cwd() / "docx_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
-
-def find_eocd(buf: bytes) -> Tuple[int, int, int, int]:
-    """
-    Locate EOCD by scanning backwards. Return (eocd_off, cd_off, cd_size, comment_len).
-    """
-    max_scan = min(len(buf), 65557)
-    window = buf[len(buf)-max_scan:]
-    for i in range(len(window) - 22, -1, -1):
-        if read_u32(window, i) == SIG_EOCD:
-            eocd_off = len(buf) - max_scan + i
-            comment_len = read_u16(window, i + 20)
-            if i + 22 + comment_len <= len(window):
-                cd_size = read_u32(window, i + 12)
-                cd_off  = read_u32(window, i + 16)
-                return eocd_off, cd_off, cd_size, comment_len
-    raise ValueError('EOCD not found')
-
-
-def iterate_cd_entries(buf: bytes, cd_off: int, cd_size: int) -> Iterable[Dict]:
-    """
-    Parse and iterate central directory entries.
-    """
-    p = cd_off
-    end = cd_off + cd_size
-    while p < end:
-        if read_u32(buf, p) != SIG_CFH:
-            raise ValueError(f'Invalid CFH signature at 0x{p:X}')
-        version_made    = read_u16(buf, p+4)
-        version_needed  = read_u16(buf, p+6)
-        gpf             = read_u16(buf, p+8)
-        method          = read_u16(buf, p+10)
-        dos_time        = read_u16(buf, p+12)
-        dos_date        = read_u16(buf, p+14)
-        crc32           = read_u32(buf, p+16)
-        comp_size       = read_u32(buf, p+20)
-        uncomp_size     = read_u32(buf, p+24)
-        name_len        = read_u16(buf, p+28)
-        extra_len       = read_u16(buf, p+30)
-        comment_len     = read_u16(buf, p+32)
-        disk_start      = read_u16(buf, p+34)
-        internal_attr   = read_u16(buf, p+36)
-        external_attr   = read_u32(buf, p+38)
-        lfh_rel_off     = read_u32(buf, p+42)
-        p += 46
-        name = buf[p:p+name_len]
-        p += name_len
-        extra = buf[p:p+extra_len]
-        p += extra_len
-        comment = buf[p:p+comment_len]
-        p += comment_len
-        try:
-            name_str = name.decode('utf-8') if (gpf & GPF_UTF8) else name.decode('cp437')
-        except Exception:
-            name_str = name.decode('utf-8', 'replace')
-        yield {
-            'name': name_str,
-            'name_raw': name,
-            'gpf': gpf,
-            'method': method,
-            'dos_time': dos_time,
-            'dos_date': dos_date,
-            'crc32': crc32,
-            'comp_size': comp_size,
-            'uncomp_size': uncomp_size,
-            'version_made': version_made,
-            'version_needed': version_needed,
-            'disk_start': disk_start,
-            'internal_attr': internal_attr,
-            'external_attr': external_attr,
-            'lfh_rel_off': lfh_rel_off,
-            'extra_raw': extra,
-            'comment_raw': comment,
-        }
-
-
-def parse_lfh(buf: bytes, off: int) -> Dict:
-    """
-    Extract local file header data from byte array.
-    """
-    if read_u32(buf, off) != SIG_LFH:
-        raise ValueError(f'Invalid LFH signature at 0x{off:X}')
-    version_needed  = read_u16(buf, off+4)
-    gpf             = read_u16(buf, off+6)
-    method          = read_u16(buf, off+8)
-    dos_time        = read_u16(buf, off+10)
-    dos_date        = read_u16(buf, off+12)
-    crc32           = read_u32(buf, off+14)
-    comp_size       = read_u32(buf, off+18)
-    uncomp_size     = read_u32(buf, off+22)
-    name_len        = read_u16(buf, off+26)
-    extra_len       = read_u16(buf, off+28)
-    name = buf[off+30: off+30+name_len]
-    extra = buf[off+30+name_len: off+30+name_len+extra_len]
-    try:
-        name_str = name.decode('utf-8') if (gpf & GPF_UTF8) else name.decode('cp437')
-    except Exception:
-        name_str = name.decode('utf-8', 'replace')
-    return {
-        'version_needed': version_needed,
-        'gpf': gpf,
-        'method': method,
-        'dos_time': dos_time,
-        'dos_date': dos_date,
-        'crc32': crc32,
-        'comp_size': comp_size,
-        'uncomp_size': uncomp_size,
-        'name_len': name_len,
-        'extra_len': extra_len,
-        'name_raw': name,
-        'name': name_str,
-        'extra_raw': extra,
-        'data_off': off + 30 + name_len + extra_len,
-        'lfh_off': off,
-    }
-
-def _unpack_entries(b: bytes) -> List[Dict]:
-    p = 0
-    magic = b[p:p+4]
-    if magic not in (META_MAGIC, META_MAGIC_V4, META_MAGIC_V3):
-        raise ValueError('Bad meta magic')
-    # DM4 carries a bare offset count and means Z_FULL_FLUSH; DM5 carries an
-    # explicit kind first, so a stream cut with Z_BLOCK is not replayed as a
-    # flush. Getting that wrong produces a plausible stream with the wrong bytes.
-    has_kind = (magic == META_MAGIC)
-    has_flush = (magic == META_MAGIC_V4)
-    p += 4
-    count = read_u32(b, p); p += 4
-    _global_flags = read_u32(b, p); p += 4
-    entries: List[Dict] = []
-    for _ in range(count):
-        name_len = read_u16(b, p); p += 2
-        name_raw = b[p:p+name_len]; p += name_len
-        is_dir = b[p]; p += 1
-        vn, gpf, method, dt, dd = struct.unpack_from('<HHHHH', b, p); p += 10
-        el_len = read_u16(b, p); p += 2
-        extra_lfh = b[p:p+el_len]; p += el_len
-        vm, vn_cd, iattr = struct.unpack_from('<HHH', b, p); p += 6
-        eattr = read_u32(b, p); p += 4
-        ec_len = read_u16(b, p); p += 2
-        extra_cd = b[p:p+ec_len]; p += ec_len
-        cm_len = read_u16(b, p); p += 2
-        comment = b[p:p+cm_len]; p += cm_len
-        use_dd = b[p]; dd_sig = b[p+1]; p += 2
-        break_kind, flush_offsets = compression_profiles.BREAK_NONE, ()
-        if has_kind:
-            break_kind = b[p]; n_off = b[p+1]; p += 2
-            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_off))
-            p += 4*n_off
-            if not flush_offsets:
-                break_kind = compression_profiles.BREAK_NONE
-        elif has_flush:
-            n_off = b[p]; p += 1
-            flush_offsets = tuple(read_u32(b, p + 4*k) for k in range(n_off))
-            p += 4*n_off
-            if flush_offsets:
-                break_kind = compression_profiles.BREAK_FULL
-        try:
-            name_str = name_raw.decode('utf-8') if (gpf & GPF_UTF8) else name_raw.decode('cp437')
-        except Exception:
-            name_str = name_raw.decode('utf-8', 'replace')
-        entries.append({
-            'name': name_str,
-            'name_raw': name_raw,
-            'is_dir': bool(is_dir),
-            'lfh': {
-                'version_needed': vn,
-                'flags': gpf,
-                'method': method,
-                'dos_time': dt,
-                'dos_date': dd,
-                'extra_lfh': extra_lfh,
-            },
-            'cd': {
-                'version_made_by': vm,
-                'version_needed': vn_cd,
-                'internal_attr': iattr,
-                'external_attr': eattr,
-                'extra_cd': extra_cd,
-                'comment': comment,
-            },
-            'policy': {
-                'use_data_descriptor': bool(use_dd),
-                'dd_has_signature': bool(dd_sig),
-                'flush_offsets': flush_offsets,
-                'break_kind': break_kind,
-            },
-        })
-    return entries
-
-# Single source of truth, shared with the clean filter so the two cannot drift.
-COMPRESSION_PROFILES: List[Dict] = compression_profiles.PROFILES
-
 
 def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = (),
                           break_kind: int = compression_profiles.BREAK_NONE) -> bytes:
@@ -241,25 +46,32 @@ def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = (),
     """
     return compression_profiles.compress_entry(data, profile, break_kind, flush_offsets)
 
-def _parse_metadata(metadata_line: str) -> List[Dict]:
-    parts = metadata_line.split()
-    if len(parts) < 4 or parts[0] != 'ENTRIES_BASE85' or parts[-2] != 'SHA256':
-        raise ValueError('Malformed ENTRIES_BASE85 line')
-    b85 = parts[1]
-    sha = parts[-1]
-    blob = decode_b85(b85)
-    if calculate_sha256(blob) != sha:
-        raise ValueError('ENTRIES_BASE85 SHA256 mismatch')
-    return _unpack_entries(blob)
+def _preflate_streams(input_dir: Path, entries: List[Dict]) -> Dict[int, bytes]:
+    """Deflate streams rebuilt from fallback corrections, keyed by id(entry)."""
+    todo = [e for e in entries if e['policy'].get('preflate') is not None
+            and e['lfh']['method'] == METHOD_DEFLATE and not e['is_dir']]
+    if not todo:
+        return {}
+    pairs = []
+    for e in todo:
+        src = input_dir / e['name']
+        if not src.is_file():
+            raise FileNotFoundError(f"Missing input file for entry: {e['name']}")
+        pairs.append((src.read_bytes(), e['policy']['preflate']))
+    streams = preflate_fallback.recreate(pairs)
+    logging.info(f"Fallback rebuilt {len(streams)} deflated entries with preflate")
+    return {id(e): s for e, s in zip(todo, streams)}
 
-def build_docx_bytes(input_dir: Path, metadata_line: str,
-                     profile: Dict = None) -> bytes:
+
+def build_docx_bytes(input_dir: Path, entries: List[Dict], profile: Dict,
+                     archive_comment: bytes = b"") -> bytes:
     """
-    Build a DOCX archive in-memory from uncompressed files and metadata,
-    using the given zlib parameters for DEFLATE entries.
+    Build the archive in memory from the extracted parts and the pointer's
+    entry list, compressing DEFLATE entries with `profile` - or, for entries
+    that carry fallback corrections, rebuilding them with preflate (all of a
+    document's in one helper call, before the archive is written).
     """
-    entries = _parse_metadata(metadata_line)
-    profile = profile or COMPRESSION_PROFILES[0]
+    rebuilt = _preflate_streams(input_dir, entries)
 
     out = io.BytesIO()
     cd_records: List[bytes] = []
@@ -285,6 +97,8 @@ def build_docx_bytes(input_dir: Path, metadata_line: str,
         crc32 = zlib.crc32(raw) & 0xFFFFFFFF
         if lfh['method'] == METHOD_STORE:
             comp = raw
+        elif lfh['method'] == METHOD_DEFLATE and id(ent) in rebuilt:
+            comp = rebuilt[id(ent)]
         elif lfh['method'] == METHOD_DEFLATE:
             comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()),
                                          pol.get('break_kind', compression_profiles.BREAK_NONE))
@@ -335,8 +149,8 @@ def build_docx_bytes(input_dir: Path, metadata_line: str,
             cd.get('version_needed', lfh['version_needed']),
             lfh['flags'],
             lfh['method'],
-            lfh['dos_time'],
-            lfh['dos_date'],
+            cd.get('dos_time', lfh['dos_time']),
+            cd.get('dos_date', lfh['dos_date']),
             crc32,
             comp_size,
             uncomp_size,
@@ -365,19 +179,11 @@ def build_docx_bytes(input_dir: Path, metadata_line: str,
         total_entries,
         cd_size,
         cd_start,
-        0,
+        len(archive_comment),
     )
     out.write(eocd)
+    out.write(archive_comment)
     return out.getvalue()
-
-def build_from_metadata(input_dir: Path, metadata_line: str, output_path: Path,
-                        level: int = 6, memlevel: int = 8) -> None:
-    """
-    Wrapper that writes the in-memory archive to disk.
-    """
-    data = build_docx_bytes(input_dir, metadata_line, level=level, memlevel=memlevel)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(data)
 
 def repo_from_cwd():
     """
@@ -421,59 +227,46 @@ def extract_tree(repo, tree, path: Path, _pending=None):
                 p.write_bytes(contents[oid])
                 logging.debug(f"Extracted LFS part: {p} ({oid})")
 
-def _profile_order(profile_name):
+def profile_for(profile_name):
     """
-    Try the profile the clean filter recorded first, then the rest.
+    The one profile this pointer is rebuilt with - no search.
 
-    The recorded one is not merely a hint: block breaks are fitted against a
-    specific profile and mean nothing against another, so for a DM5 pointer this
-    is the only candidate that can work. The others still follow, because a
-    pointer naming an unknown profile should degrade to a search rather than
-    fail outright.
+    Every pointer names its profile; `fallback` means clean found none that
+    reproduces the document. A name this version does not know is an error,
+    not a reason to guess: the pointer was written by a newer extension.
     """
-    if not profile_name:
-        return COMPRESSION_PROFILES
+    if profile_name == pointer_format.FALLBACK_PROFILE:
+        # Entries with preflate corrections are rebuilt from those; this zlib
+        # profile only serves deflated entries the fallback could not model.
+        logging.info("Pointer records the fallback: preflate corrections where present, "
+                     f"otherwise {compression_profiles.describe(compression_profiles.FALLBACK)}")
+        return compression_profiles.FALLBACK
     named = compression_profiles.BY_NAME.get(profile_name)
     if named is None:
-        logging.warning(f"Pointer names unknown profile {profile_name!r}; searching instead")
-        return COMPRESSION_PROFILES
+        raise ValueError(f"pointer names compression profile {profile_name!r}, which this "
+                         f"version of the extension does not know; update the extension")
+    if named['kind'] == 'msword' and not msword_compressor.is_available():
+        raise RuntimeError("pointer needs the msword profile, which needs a shared zlib "
+                           "with deflateTune (Windows: zlib1.dll); none was found")
     logging.info(f"Pointer records profile {compression_profiles.describe(named)}")
-    return [named] + [p for p in COMPRESSION_PROFILES if p['name'] != profile_name]
+    return named
 
 
-def recompress_docx(input_dir: Path, metadata_line: str, expected_hash: str,
-                    profile_name: str = None) -> Tuple[bytes, str, dict]:
+def recompress_docx(input_dir: Path, entries: List[Dict], profile: Dict,
+                    archive_comment: bytes = b"") -> Tuple[bytes, str, dict]:
     """
-    Deterministically recompress docx from pointer file metadata by trying each
-    entry of COMPRESSION_PROFILES until the whole-archive SHA256 matches.
-    Return (docx_bytes, matched_profile_name, meta); the name is "none" when
-    nothing reproduced the original, in which case the bytes are best-effort.
+    Rebuild the archive once, with `profile`. Return (docx_bytes, profile_name,
+    meta); the caller compares meta['sha'] with the committed hash.
     """
-    fallback = None
-    for profile in _profile_order(profile_name):
-        try:
-            docx_bytes = build_docx_bytes(input_dir, metadata_line, profile=profile)
-        except Exception as e:
-            logging.warning(f"Profile {profile['name']} raised: {e}")
-            continue
-        sha = calculate_sha256(docx_bytes)
-        logging.info(f"Profile {profile['name']} SHA256={sha}")
-        meta = {"profile": profile, "level": profile.get("level"),
-                "memLevel": profile.get("memlevel"), "sha": sha}
-        if expected_hash and sha == expected_hash:
-            logging.info(f"Profile {profile['name']} matched expected hash.")
-            return docx_bytes, profile["name"], meta
-        if fallback is None:
-            fallback = (docx_bytes, meta)
-
-    logging.warning("No recompression profile matched the expected hash; emitting best effort.")
-    if fallback is None:
-        return b"", "none", {"profile": None, "level": None, "memLevel": None, "sha": ""}
-    return fallback[0], "none", fallback[1]
+    docx_bytes = build_docx_bytes(input_dir, entries, profile, archive_comment)
+    sha = calculate_sha256(docx_bytes)
+    logging.info(f"Profile {profile['name']} SHA256={sha}")
+    meta = {"profile": profile, "level": profile.get("level"),
+            "memLevel": profile.get("memlevel"), "sha": sha}
+    return docx_bytes, profile["name"], meta
 
 
-def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
-                  profile_name: str = None, path: str = "<unknown>"):
+def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
     """
     Recreate the original document from the pointer.
 
@@ -486,7 +279,18 @@ def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
     newest, so resolving by name returns the latest parts for every revision -
     a wrong document, delivered without an error.
     """
-    logging.info(f"Creating document from parts tree {tree_oid}")
+    tree_oid, expected_hash = ptr.tree, ptr.hash
+    logging.info(f"Creating document from parts tree {tree_oid} "
+                 f"(pointer format {pointer_format.format_version(ptr.version)})")
+    # Settle the profile first: an unknown or unavailable one fails here,
+    # before any parts are extracted or images downloaded.
+    profile_def = profile_for(ptr.profile)
+    if ptr.fallback:
+        # The corrections only mean something to the preflate-rs that made them.
+        have = preflate_fallback.version()           # raises when the helper is missing
+        if have != ptr.fallback:
+            raise RuntimeError(f"pointer was written with {ptr.fallback} but the docx-preflate "
+                               f"helper here is {have}; build the matching helper")
     try:
         obj = repo[tree_oid]
     except (KeyError, ValueError) as e:
@@ -507,8 +311,8 @@ def recreate_docx(repo, tree_oid: str, expected_hash: str, metadata_line: str,
         extract_tree(repo, tree, tmp_path)
 
         # Compress folder to recreate the original docx:
-        docx_bytes, profile, meta = recompress_docx(tmp_path, metadata_line, expected_hash,
-                                                    profile_name)
+        docx_bytes, profile, meta = recompress_docx(tmp_path, ptr.entries, profile_def,
+                                                    ptr.archive.get('comment', b''))
 
         # Log outcome
         logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
@@ -542,32 +346,21 @@ def main():
     # lines. Anything that is not one of our pointers must be copied through
     # byte for byte.
     data = sys.stdin.buffer.read()
-    if not data.startswith(POINTER_MAGIC.encode("ascii")):
+    if not pointer_format.is_pointer(data):
         logging.info("Not a docx pointer (%d bytes); passing through unchanged", len(data))
         sys.stdout.buffer.write(data)
         return
 
-    headers, metadata_line = {}, None
-    for raw in data.decode("utf-8", "replace").splitlines():
-        line = raw.strip()
-        if line.startswith("ENTRIES_BASE85"):
-            metadata_line = line
-            break
-        if ":" in line:
-            key, value = line.split(":", 1)
-            headers[key.strip()] = value.strip()
-
-    tree_oid = headers.get("TREE")
-    expected_hash = headers.get("HASH")
-    if not tree_oid or metadata_line is None:
-        logging.error("Malformed pointer: %r", data[:120])
-        sys.stderr.write("smudge_filter.py: pointer has no TREE or no entry table\n")
+    try:
+        ptr = pointer_format.parse(data.decode("utf-8"))
+    except (pointer_format.PointerError, UnicodeDecodeError) as e:
+        logging.error("Unreadable pointer for %s: %s", path, e)
+        sys.stderr.write(f"smudge_filter.py: {path}: {e}\n")
         sys.exit(1)
 
     try:
         repo = repo_from_cwd()
-        recreate_docx(repo, tree_oid, expected_hash, metadata_line,
-                      headers.get("PROFILE"), path)
+        recreate_docx(repo, ptr, path)
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")
         # Fail loudly. Exiting 0 with nothing on stdout makes git write a 0-byte

@@ -1,58 +1,25 @@
 #!/usr/bin/env python3
 """
-Format of pointer-file:
-    DOCX-POINTER <human-readable notice>      <- magic; identifies the file
-    TREE:<oid of the git tree holding the unpacked parts>
-    HASH:<sha256 of the original document>
-    PROFILE:<compression profile name>        <- only when one was needed
-    ENTRIES_BASE85 <b85> SHA256 <hex>
+Clean filter: store a document as a git tree of its unpacked parts, and hand
+git a small text pointer in its place.
 
-TREE is authoritative. The smudge filter resolves that oid directly and never
-looks up a ref: a ref holds whichever version is newest, so resolving by name
-hands back the wrong document for every commit except the latest.
+The pointer format (VERSION, TREE, HASH, PROFILE, DEFAULTS, ENTRY lines) is
+defined and documented in pointer_format.py, which the smudge filter reads with
+the same code. TREE is authoritative: smudge resolves that oid directly and
+never looks up a ref, because a ref holds whichever version is newest.
 
-There is deliberately no refname in here. It would only restate what the ref
-naming already derives from the file's own path (see ref_names.py), and two
-sources for one fact is how they drift apart.
-
-The header lines before ENTRIES_BASE85 are parsed by key rather than position,
-so a new field can be added without disturbing the readers of the old ones.
-
-Where ENTRIES_BASE85 is a base85 of a compact binary table:
-  Header:
-    - magic: b"DM3\x00"
-    - entry_count: u32
-    - global_flags: u32  (bit0: zip64_present)
-  Repeated per entry:
-    - name_len: u16
-    - name_bytes: name_len bytes  (as stored; UTF-8 if GPF_UTF8 else CP437)
-    - is_dir: u8  (0/1)
-    - lfh.version_needed: u16
-    - lfh.flags: u16
-    - lfh.method: u16
-    - lfh.dos_time: u16
-    - lfh.dos_date: u16
-    - extra_lfh_len: u16
-    - extra_lfh: extra_lfh_len bytes
-    - cd.version_made_by: u16
-    - cd.version_needed: u16
-    - cd.internal_attr: u16
-    - cd.external_attr: u32
-    - extra_cd_len: u16
-    - extra_cd: extra_cd_len bytes
-    - comment_len: u16
-    - comment: comment_len bytes
-    - policy.use_data_descriptor: u8 (0/1)
-    - policy.dd_has_signature:  u8 (0/1)
+There is deliberately no refname in the pointer. It would only restate what the
+ref naming already derives from the file's own path, and two sources for one
+fact is how they drift apart.
 
 Notes:
 - ZIP64 is not built; we error if sizes exceed ZIP32. Typical DOCX is fine.
-- We store raw name bytes; for filesystem lookup we decode using GPF_UTF8 or CP437.
+- Entry names are kept as stored bytes; for filesystem lookup they are decoded
+  using GPF_UTF8 or CP437.
 """
 
 from __future__ import annotations
 from pathlib import Path
-import struct
 import sys
 from typing import Dict, Iterable, List, Tuple
 import sys
@@ -65,7 +32,9 @@ import block_breaks
 import compression_profiles
 import msword_compressor
 import lfs_parts
-from utils.utils import (read_u16, read_u32, encode_b85, calculate_sha256, repo_from_cwd, calculate_file_sha256)
+import pointer_format
+import preflate_fallback
+from utils.utils import (read_u16, read_u32, calculate_sha256, repo_from_cwd, calculate_file_sha256)
 
 # === ZIP constants ===
 SIG_LFH   = 0x04034B50
@@ -79,42 +48,32 @@ GPF_UTF8            = 0x0800
 
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
-META_MAGIC_V3 = b"DM3\x00"   # no break list at all
-META_MAGIC_V4 = b"DM4\x00"   # per-entry Z_FULL_FLUSH offsets (Word)
-META_MAGIC = b"DM5\x00"      # per-entry (break kind, offsets)
-
-# Always write the OLDEST magic that can express this document. A pointer whose
-# bytes change for no reason makes git report every docx as modified the day a
-# new field ships, so DM5 appears only when some entry actually needs it.
-
-# The pointer's first line. POINTER_MAGIC identifies the file as ours; the
-# smudge filter and the post-commit hook each repeat this one string rather
-# than import it, so none of the three can break the others by being absent,
-# edited or moved. It is a format constant - if it ever changes, it changes in
-# the pointer format, and all three have to be revisited anyway.
-POINTER_MAGIC = "DOCX-POINTER"
-POINTER_NOTICE = ("placeholder - this repository stores documents unpacked; "
-                  "run the docx extension's install step here, then "
-                  "'git checkout -- .' to get the real file")
+# The pointer's first line. Defined in pointer_format, which smudge shares;
+# the post-commit hook repeats the prefix because it must stay self-contained.
+POINTER_MAGIC = pointer_format.POINTER_MAGIC
 
 log_path = Path.cwd() / "docx_clean.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 
-def find_eocd(buf: bytes) -> Tuple[int, int, int, int]:
-    """
-    Locate EOCD (End Of Central Directory) by scanning backwards.
-    Return Central Directory offset and Central Directory Size.
-    """
-    max_scan = min(len(buf), 65557)
-    window = buf[len(buf)-max_scan:]
-    for i in range(len(window) - 22, -1, -1):
-        if read_u32(window, i) == SIG_EOCD:
-            comment_len = read_u16(window, i + 20)
-            if i + 22 + comment_len <= len(window):
-                cd_size = read_u32(window, i + 12)
-                cd_off  = read_u32(window, i + 16)
-                return cd_off, cd_size
+def _eocd_offset(buf: bytes) -> int:
+    """Offset of the EOCD (End Of Central Directory) record, found by scanning backwards."""
+    start = len(buf) - min(len(buf), 65557)
+    for i in range(len(buf) - 22, start - 1, -1):
+        if read_u32(buf, i) == SIG_EOCD and i + 22 + read_u16(buf, i + 20) <= len(buf):
+            return i
     raise ValueError('EOCD not found')
+
+
+def find_eocd(buf: bytes) -> Tuple[int, int]:
+    """Central Directory offset and size, from the EOCD record."""
+    i = _eocd_offset(buf)
+    return read_u32(buf, i + 16), read_u32(buf, i + 12)
+
+
+def archive_comment(buf: bytes) -> bytes:
+    """The zip's own comment, stored in the EOCD record (usually empty)."""
+    i = _eocd_offset(buf)
+    return buf[i + 22:i + 22 + read_u16(buf, i + 20)]
 
 
 def iterate_cd_entries(buf: bytes, cd_off: int, cd_size: int) -> Iterable[Dict]:
@@ -232,24 +191,29 @@ def _collect_entries(buf: bytes, cd_off: int, cd_size: int) -> List[Dict]:
             if data_end + 4 <= len(buf) and read_u32(buf, data_end) == SIG_DD:
                 dd_has_sig = 1
         name = c['name_raw']
-        is_dir = 1 if name.endswith(b'/') else 0
+        is_dir = name.endswith(b'/')
         extra_lfh = lfh['extra_raw']
         extra_cd  = c['extra_raw']
-        comment   = c['comment_raw']
-        rec = [
-            struct.pack('<H', len(name)), name,
-            struct.pack('<B', is_dir),
-            struct.pack('<HHHHH', lfh['version_needed'], lfh['gpf'], lfh['method'], lfh['dos_time'], lfh['dos_date']),
-            struct.pack('<H', len(extra_lfh)), extra_lfh,
-            struct.pack('<HHH', c['version_made'], c['version_needed'], c['internal_attr']),
-            struct.pack('<I', c['external_attr']),
-            struct.pack('<H', len(extra_cd)), extra_cd,
-            struct.pack('<H', len(comment)), comment,
-            struct.pack('<BB', use_dd, dd_has_sig),
-        ]
+        # What the pointer records for this entry, in the structure
+        # pointer_format writes and smudge rebuilds from.
+        entry = {
+            'name': c['name'],
+            'name_raw': name,
+            'is_dir': is_dir,
+            'lfh': {'version_needed': lfh['version_needed'], 'flags': lfh['gpf'],
+                    'method': lfh['method'], 'dos_time': lfh['dos_time'],
+                    'dos_date': lfh['dos_date'], 'extra_lfh': extra_lfh},
+            'cd': {'version_made_by': c['version_made'], 'version_needed': c['version_needed'],
+                   'dos_time': c['dos_time'], 'dos_date': c['dos_date'],
+                   'internal_attr': c['internal_attr'], 'external_attr': c['external_attr'],
+                   'extra_cd': extra_cd, 'comment': c['comment_raw']},
+            'policy': {'use_data_descriptor': bool(use_dd), 'dd_has_signature': bool(dd_has_sig),
+                       'flush_offsets': (), 'break_kind': compression_profiles.BREAK_NONE,
+                       'preflate': None},
+        }
         items.append({
             'name': c['name'],
-            'rec': b''.join(rec),
+            'entry': entry,
             'method': lfh['method'],
             'is_dir': bool(is_dir),
             'comp': buf[lfh['data_off']:lfh['data_off'] + comp_len],
@@ -263,63 +227,32 @@ def _collect_entries(buf: bytes, cd_off: int, cd_size: int) -> List[Dict]:
     return items
 
 
-def _flush_offsets(items: List[Dict]) -> List[Tuple[int, Tuple[int, ...]]]:
+def _choose_profile(items: List[Dict]):
     """
-    Word's Z_FULL_FLUSH positions, one list per entry.
+    Pick the one profile that reproduces every deflated entry, and the
+    per-entry breaks it needs. Returns (profile_name, breaks), or (None, no
+    breaks) when no profile does - the pointer then records `PROFILE fallback`,
+    and smudge uses the fallback compression.
 
-    Each flush leaves an empty stored block behind, so if no stream anywhere in
-    the archive contains an empty block, no entry can have flush offsets and the
-    whole scan can be skipped. That check runs through libz and is ~300x faster
-    than the Python bit-walker, which on a 17 MB document is 0.1s against 40s.
+    Early exit everywhere a wrong answer can be recognised:
+      * every comparison against the original streams the compressor's output
+        and stops at the first block that differs;
+      * a candidate is dropped at the first entry it cannot reproduce, and the
+        largest entry is tried first because it tells candidates apart best;
+      * empty blocks are read with libz in one pass per entry: Word's flush
+        offsets come from that pass, and any empty block rules out the plain
+        zlib profiles without compressing anything;
+      * the break fitter resumes from its last confirmed break and stops each
+        round at the first difference.
     """
-    breaks: List[Tuple[int, Tuple[int, ...]]] = [
-        (compression_profiles.BREAK_NONE, ())] * len(items)
+    none = [(compression_profiles.BREAK_NONE, ())] * len(items)
     deflated = [i for i, it in enumerate(items)
                 if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
     if not deflated:
-        return breaks
-
-    if block_breaks.is_available():
-        try:
-            if not any(block_breaks.has_empty_blocks(items[i]['comp'], items[i]['usize'])
-                       for i in deflated):
-                logging.debug("No empty deflate blocks anywhere; skipping the flush scan")
-                return breaks
-        except Exception as e:
-            logging.warning(f"empty-block pre-scan failed, falling back to full scan: {e}")
-
-    for i in deflated:
-        try:
-            offs = tuple(msword_compressor.detect_flush_offsets(items[i]['comp']))
-        except Exception as e:
-            logging.warning(f"flush-offset scan failed for {items[i]['name']}: {e}")
-            continue
-        if offs:
-            breaks[i] = (compression_profiles.BREAK_FULL, offs)
-    return breaks
-
-
-def _fit_block_breaks(items: List[Dict]):
-    """
-    Find a zlib profile plus per-entry block breaks that reproduces every
-    deflated entry byte for byte. Returns (profile_name, breaks) or (None, None).
-
-    Some packagers use stock zlib knobs but cut blocks early with Z_BLOCK, which
-    leaves no marker in the stream. The LZ77 decisions are then plain zlib's, so
-    no (level, memLevel, strategy) search can ever match the bytes - the only
-    missing information is where the cuts were.
-
-    Candidate profiles are tried closest-first by the size of their plain output
-    against the original. That is only an ordering, never a filter: a profile
-    that sorts badly still gets its turn, it just waits.
-    """
-    if not (block_breaks.is_available() and block_breaks.supports_z_block()):
-        logging.debug("block-break fitting unavailable on this host; skipping")
-        return None, None
-    deflated = [i for i, it in enumerate(items)
-                if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
-    if not deflated:
-        return None, None
+        # Nothing is compressed, so every profile rebuilds it; record the first.
+        return compression_profiles.PROFILES[0]['name'], none
+    deflated.sort(key=lambda i: -len(items[i]['comp']))     # probe = largest
+    probe = deflated[0]
 
     raws: Dict[int, bytes] = {}
     for i in deflated:
@@ -327,141 +260,156 @@ def _fit_block_breaks(items: List[Dict]):
             raws[i] = zlib.decompress(items[i]['comp'], -15)
         except Exception as e:
             logging.warning(f"cannot inflate {items[i]['name']}: {e}")
-            return None, None
+            return None, none
 
-    # Probe on the largest entry: it discriminates best between near-neighbour
-    # profiles, and a wrong profile is rejected there in a fraction of a second.
-    probe = max(deflated, key=lambda i: len(items[i]['comp']))
-    order = []
-    for p in compression_profiles.ZLIB_PROFILES:
-        try:
-            plain = compression_profiles.compress_entry(raws[probe], p)
-        except Exception:
+    can_scan = block_breaks.is_available()
+    empty: Dict[int, bool] = {}
+    flushes: Dict[int, Tuple[int, ...]] = {}
+    for i in deflated:
+        if can_scan:
+            try:
+                empty[i], flushes[i] = block_breaks.empty_blocks(items[i]['comp'], items[i]['usize'])
+                continue
+            except Exception as e:
+                logging.warning(f"block scan failed for {items[i]['name']}: {e}")
+        empty[i], flushes[i] = False, ()
+
+    candidates = []
+    # Word ends every part with a flush, so it is only a candidate when every
+    # deflated entry has an empty block - and then it is the likely one.
+    if all(empty[i] for i in deflated) and msword_compressor.is_available():
+        candidates.append(compression_profiles.BY_NAME['msword'])
+    # A plain zlib profile never writes an empty block: any entry that has one
+    # rules all of them out. Otherwise try them in order of how much of the
+    # largest entry each reproduces before it first differs (an early-exit
+    # comparison, typically a block or two of work per candidate).
+    if not any(empty[i] for i in deflated):
+        ranked = []
+        for p in compression_profiles.ZLIB_PROFILES:
+            n = block_breaks.matching_prefix(
+                compression_profiles.iter_compress_entry(raws[probe], p), items[probe]['comp'])
+            ranked.append((-n, len(ranked), p))
+        candidates += [p for _, _, p in sorted(ranked, key=lambda t: t[:2])]
+
+    for profile in candidates:
+        breaks = _fit_profile(items, deflated, raws, flushes, profile, can_scan)
+        if breaks is not None:
+            logging.info(f"Profile {profile['name']} reproduces every deflated entry")
+            return profile['name'], breaks
+        logging.debug(f"Profile {profile['name']} rejected")
+    logging.warning("No profile reproduces this document; the pointer records "
+                    "PROFILE fallback and checkout will use the fallback compression")
+    return None, none
+
+
+def _fit_profile(items, deflated, raws, flushes, profile, can_scan):
+    """Per-entry breaks for `profile`, or None at the first entry it can't reproduce."""
+    breaks = [(compression_profiles.BREAK_NONE, ())] * len(items)
+    for i in deflated:                       # largest first: wrong candidates fail fast
+        raw, comp = raws[i], items[i]['comp']
+        if profile['kind'] == 'msword':
+            kind = compression_profiles.BREAK_FULL if flushes[i] else compression_profiles.BREAK_NONE
+            if not compression_profiles.entry_matches(raw, comp, profile, kind, flushes[i]):
+                return None
+            breaks[i] = (kind, flushes[i])
             continue
-        order.append((abs(len(plain) - len(items[probe]['comp'])), p))
-    order.sort(key=lambda t: t[0])
-
-    for _, profile in order:
-        br = _fit_all(items, deflated, raws, profile, probe)
-        if br is not None:
-            return profile['name'], br
-    logging.debug("no zlib profile reproduces this archive, with or without block breaks")
-    return None, None
-
-
-def _fit_all(items, deflated, raws, profile, probe):
-    """Fit `profile` to the probe entry first, then to every entry. All or nothing."""
-    level, ml = profile['level'], profile['memlevel']
-    strat = profile.get('strategy', 0)
-
-    def fit_one(i, rounds):
-        comp = items[i]['comp']
-        if compression_profiles.compress_entry(raws[i], profile) == comp:
-            return (compression_profiles.BREAK_NONE, ())
-        offs = block_breaks.fit_breaks(raws[i], comp, items[i]['usize'],
-                                       level, ml, strat, rounds=rounds)
+        if compression_profiles.entry_matches(raw, comp, profile):
+            continue
+        if not (can_scan and block_breaks.supports_z_block()):
+            return None
+        offs = block_breaks.fit_breaks(raw, comp, items[i]['usize'], profile['level'],
+                                       profile['memlevel'], profile.get('strategy', 0))
         if offs is None:
             return None
-        return (compression_profiles.BREAK_BLOCK, tuple(offs))
-
-    # The fitter rejects a wrong profile on its own, as soon as the agreeing
-    # prefix stops growing, so the probe gets the full budget. Capping it lower
-    # would reject a correct profile on a document with many breaks.
-    if fit_one(probe, rounds=block_breaks.FIT_ROUNDS) is None:
-        return None
-
-    breaks = [(compression_profiles.BREAK_NONE, ())] * len(items)
-    for i in deflated:
-        got = fit_one(i, rounds=block_breaks.FIT_ROUNDS)
-        if got is None:
-            logging.debug(f"profile {profile['name']} fits the probe but not "
-                          f"{items[i]['name']}; trying the next profile")
-            return None
-        breaks[i] = got
+        breaks[i] = (compression_profiles.BREAK_BLOCK, tuple(offs))
     return breaks
 
 
-def _pack_entries(items: List[Dict], breaks) -> bytes:
+def _preflate_corrections(items: List[Dict]):
     """
-    Serialise the entry table, choosing the oldest magic that can carry it.
+    The fallback: preflate-rs corrections for every deflated entry, as
+    (fallback tool/version, {item index: corrections}). The helper verifies
+    each one by rebuilding the stream, so what is recorded does rebuild.
 
-    DM3 has no break list, DM4 carries Word's flush offsets, DM5 carries a kind
-    tag alongside them. Writing DM5 unconditionally would change the pointer of
-    every already-committed document and make git report them all as modified,
-    so the version only rises when a document actually needs it.
+    Without the helper, or for a stream preflate cannot model, the entry gets
+    no corrections; smudge then tries plain zlib and the hash check decides.
+    Both cases are reported here, at add time, not discovered at checkout.
     """
-    kinds = {k for k, offs in breaks if offs}
-    if compression_profiles.BREAK_BLOCK in kinds:
-        magic, version = META_MAGIC, 'DM5'
-    elif compression_profiles.BREAK_FULL in kinds:
-        magic, version = META_MAGIC_V4, 'DM4'
-    else:
-        magic, version = META_MAGIC_V3, 'DM3'
+    deflated = [i for i, it in enumerate(items)
+                if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
+    if not deflated:
+        return None, {}
+    try:
+        tool = preflate_fallback.version()
+    except preflate_fallback.PreflateUnavailable as e:
+        logging.warning(f"fallback unavailable: {e}")
+        sys.stderr.write(f"clean_filter.py: warning: no compression profile reproduces this "
+                         f"document and {e}. It is stored without fallback data and will not "
+                         f"check out byte-identical; re-add it once the helper is built.\n")
+        return None, {}
+    results = preflate_fallback.split([items[i]['comp'] for i in deflated])
+    corrections, failed = {}, []
+    for i, (corr, why) in zip(deflated, results):
+        if corr is None:
+            failed.append(items[i]['name'])
+            logging.warning(f"preflate cannot model {items[i]['name']}: {why}")
+        else:
+            corrections[i] = corr
+    logging.info(f"Fallback {tool}: {len(corrections)} of {len(deflated)} deflated entries, "
+                 f"{sum(map(len, corrections.values()))} bytes of corrections")
+    if failed:
+        sys.stderr.write(f"clean_filter.py: warning: the fallback cannot model "
+                         f"{', '.join(failed)}; this document will not check out "
+                         f"byte-identical\n")
+    return tool, corrections
 
-    for it, (kind, offs) in zip(items, breaks):
+
+def pointer_entries(items: List[Dict], breaks, corrections=None) -> List[Dict]:
+    """The pointer's entry list: each entry with its breaks or fallback corrections."""
+    corrections = corrections or {}
+    out = []
+    for i, (it, (kind, offs)) in enumerate(zip(items, breaks)):
+        e = dict(it['entry'])
+        e['policy'] = dict(e['policy'], flush_offsets=tuple(offs),
+                           break_kind=kind if offs else compression_profiles.BREAK_NONE,
+                           preflate=corrections.get(i))
         logging.debug(
             f"entry {it['name']!r}: method={it['method']} dir={it['is_dir']} "
             f"gpf=0x{it['gpf']:04x} comp={len(it['comp'])} uncomp={it['usize']} "
             f"dd={it['use_dd']}/{it['dd_has_sig']} extra_lfh={len(it['extra_lfh'])} "
             f"extra_cd={len(it['extra_cd'])} "
             f"breaks={compression_profiles.BREAK_NAMES[kind]}:{offs or '-'}")
+        out.append(e)
+    return out
 
-    n = sum(1 for _, offs in breaks if offs)
-    logging.info(f"Packed {len(items)} entries, magic={version}, "
-                 f"{n} entries carry block breaks")
 
-    header = b''.join([magic, struct.pack('<I', len(items)), struct.pack('<I', 0)])
-    body = []
-    for it, (kind, offs) in zip(items, breaks):
-        body.append(it['rec'])
-        if version == 'DM5':
-            body.append(struct.pack('<BB', kind, len(offs)))
-            body.append(b''.join(struct.pack('<I', o) for o in offs))
-        elif version == 'DM4':
-            body.append(struct.pack('<B', len(offs)))
-            body.append(b''.join(struct.pack('<I', o) for o in offs))
-    return header + b''.join(body)
-
-def dump_metadata(b: bytes) -> None:
+def build_pointer(b: bytes, tree_oid: str, docx_hash: str) -> str:
     """
-    Write xml metadata to a pointer file. Takes the document's bytes so it
-    cannot disagree with the tree built from those same bytes.
+    The pointer text for document bytes `b`. Takes the document's bytes so the
+    entry list cannot disagree with the tree built from those same bytes.
     """
     cd_off, cd_size = find_eocd(b)
     logging.debug(f"EOCD: central directory at {cd_off}, {cd_size} bytes")
     items = _collect_entries(b, cd_off, cd_size)
 
-    # Two producers, two mechanisms. Word splits a part into pieces and flushes
-    # between them, leaving an empty block behind each time; other packagers cut
-    # blocks with Z_BLOCK, which leaves nothing. Look for the visible one first,
-    # because it is cheap to rule out and its absence is what makes the second
-    # search worth running at all.
-    breaks = _flush_offsets(items)
-    profile_name = None
-    if not any(offs for _, offs in breaks):
-        profile_name, fitted = _fit_block_breaks(items)
-        if fitted is not None:
-            breaks = fitted
-            if not any(offs for _, offs in breaks):
-                # The profile reproduces the document as-is. Recording it would
-                # change pointers that are currently correct, for no gain.
-                profile_name = None
-        else:
-            profile_name = None
-
-    entries_blob = _pack_entries(items, breaks)
-    entries_b85 = encode_b85(entries_blob)
-    entries_sha = calculate_sha256(entries_blob)
-    logging.info(f"Entry table: {len(entries_blob)} bytes raw, {len(entries_b85)} base85, "
-                 f"SHA256={entries_sha}")
-
+    profile_name, breaks = _choose_profile(items)
+    fallback, corrections = None, {}
     if profile_name:
-        # Only written when the document needs block breaks, which are only
-        # meaningful against the profile they were fitted to. Smudge reads this
-        # by key, so older pointers without it still parse.
+        # Recorded always, so smudge never has to search: it rebuilds once,
+        # with exactly this profile.
         logging.info(f"Recording compression profile: {profile_name}")
-        sys.stdout.write(f'PROFILE:{profile_name}\n')
-    sys.stdout.write(f'ENTRIES_BASE85 {entries_b85} SHA256 {entries_sha}\n')
+    else:
+        profile_name = pointer_format.FALLBACK_PROFILE
+        fallback, corrections = _preflate_corrections(items)
+
+    entries = pointer_entries(items, breaks, corrections)
+    n = sum(1 for _, offs in breaks if offs)
+    logging.info(f"{len(entries)} entries, {n} with breaks, profile {profile_name}")
+    comment = archive_comment(b)
+    if comment:
+        logging.info(f"Archive comment: {len(comment)} bytes")
+    return pointer_format.write(tree_oid, docx_hash, profile_name, entries,
+                                fallback if corrections else None, comment)
 
 def add_directory_to_tree(repo, base_path, tree_builder, lfs_extensions=frozenset()):
     """
@@ -552,18 +500,10 @@ def main():
     docx_hash = calculate_sha256(docx_bytes)
     logging.info(f"Document SHA256={docx_hash}, parts tree {tree_oid}")
 
-    # First line doubles as the magic the post-commit hook recognises and as a
-    # message for whoever opens this file in a clone that has not run install.py
-    # - without the filter configured, git writes these bytes into the worktree
-    # under the document's own name, and a bare "DOCX-POINTER:" told them
-    # nothing about what to do next.
-    sys.stdout.write(f"{POINTER_MAGIC} {POINTER_NOTICE}\n")
-    # The parts tree, named by content. Smudge resolves THIS, never a ref: a ref
-    # always holds the newest version, so resolving by name silently returns the
-    # wrong document for every commit but the latest.
-    sys.stdout.write(f"TREE:{tree_oid}\n")
-    sys.stdout.write(f"HASH:{docx_hash}\n")
-    dump_metadata(docx_bytes)
+    # Built completely before anything reaches stdout, so a failure can never
+    # leave git holding half a pointer.
+    pointer = build_pointer(docx_bytes, str(tree_oid), docx_hash)
+    sys.stdout.write(pointer)
     logging.info(f"Wrote pointer for {docx_path}: tree={tree_oid} hash={docx_hash}")
 
 if __name__ == "__main__":

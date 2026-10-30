@@ -45,11 +45,16 @@ import logging
 import zlib
 from typing import Optional, Tuple
 
-Z_OK, Z_STREAM_END, Z_BLOCK = 0, 1, 5
+Z_OK, Z_STREAM_END, Z_BLOCK, Z_BUF_ERROR = 0, 1, 5, -5
 
-# How many rounds the fitter may take before giving up on an entry. Each round
-# pins down one forced break; real producers need a few per megabyte.
-FIT_ROUNDS = 256
+# Input is fed to the compressor in pieces of this size, so output appears as
+# blocks complete and a comparison against the original can stop at the first
+# block that differs. Splitting the input does not change zlib's output: with
+# Z_NO_FLUSH it waits for enough lookahead before every decision.
+STREAM_CHUNK = 1 << 16
+
+# Bit 7 of z_stream.data_type: inflate() stopped right after an end-of-block code.
+_DATA_TYPE_BLOCK_END = 128
 
 
 class _ZStream(ctypes.Structure):
@@ -91,6 +96,7 @@ def _load_libz() -> Optional[ctypes.CDLL]:
                                           ctypes.c_char_p, ctypes.c_int]
             lib.inflate.argtypes = [ctypes.POINTER(_ZStream), ctypes.c_int]
             lib.inflateEnd.argtypes = [ctypes.POINTER(_ZStream)]
+            lib.inflateCopy.argtypes = [ctypes.POINTER(_ZStream), ctypes.POINTER(_ZStream)]
             lib.zlibVersion.restype = ctypes.c_char_p
         except AttributeError:
             continue
@@ -123,7 +129,7 @@ def supports_z_block() -> bool:
         return False
 
 
-def scan_boundaries(comp: bytes, usize: int) -> Tuple[int, ...]:
+def scan_boundaries(comp: bytes, usize: int, partial: bool = False) -> Tuple[int, ...]:
     """
     Uncompressed offset of EVERY deflate block end in the stream, in order,
     duplicates included.
@@ -135,6 +141,9 @@ def scan_boundaries(comp: bytes, usize: int) -> Tuple[int, ...]:
     Duplicates are information, not noise: a block that produces no output is an
     empty block, which is the footprint Z_SYNC_FLUSH and Z_FULL_FLUSH leave
     behind. `has_empty_blocks` reads them.
+
+    With `partial`, `comp` may be a prefix of a stream: scanning stops where the
+    input runs out and returns the boundaries of the blocks that were complete.
     """
     if usize <= 0 or not comp:
         return ()
@@ -159,6 +168,8 @@ def scan_boundaries(comp: bytes, usize: int) -> Tuple[int, ...]:
         while True:
             rc = lib.inflate(ctypes.byref(s), Z_BLOCK)
             if rc == Z_STREAM_END:
+                break
+            if partial and (rc == Z_BUF_ERROR or s.avail_in == 0):
                 break
             if rc != Z_OK:
                 raise RuntimeError(f'inflate failed: {rc}')
@@ -198,6 +209,85 @@ def has_empty_blocks(comp: bytes, usize: int) -> bool:
     return any(offs[i] == offs[i - 1] for i in range(1, len(offs)))
 
 
+def empty_blocks(comp: bytes, usize: int) -> Tuple[bool, Tuple[int, ...]]:
+    """
+    One scan, two answers: (any empty block at all, flush offsets as returned
+    by flush_offsets()). An empty block anywhere - including the trailing one
+    a sync flush leaves - rules out every plain zlib profile, which never
+    writes one.
+    """
+    offs = scan_boundaries(comp, usize)
+    dups = {offs[i] for i in range(1, len(offs)) if offs[i] == offs[i - 1]}
+    return bool(dups), tuple(sorted(o for o in dups if o != usize))
+
+
+def flush_offsets(comp: bytes, usize: int) -> Tuple[int, ...]:
+    """
+    Uncompressed offsets of the empty blocks inside a stream - Word's piece
+    boundaries - excluding the structural flush at the very end.
+
+    Same answer as msword_compressor.detect_flush_offsets() for Word streams,
+    read with libz instead of a Python bit walker (that walker was most of a
+    clean's time on documents with large deflated images).
+    """
+    offs = scan_boundaries(comp, usize)
+    return tuple(sorted({offs[i] for i in range(1, len(offs))
+                         if offs[i] == offs[i - 1] and offs[i] != usize}))
+
+
+def iter_compress_with_breaks(data: bytes, breaks=(), level: int = 5,
+                              memlevel: int = 8, strategy: int = 0):
+    """compress_with_breaks(), yielding output as it is produced."""
+    co = zlib.compressobj(level, zlib.DEFLATED, -15, memlevel, strategy)
+    prev = 0
+    for off in tuple(breaks) + (len(data),):
+        if off < prev or off > len(data):
+            raise ValueError(f'block break {off} out of order or past end of data')
+        for i in range(prev, off, STREAM_CHUNK):
+            out = co.compress(data[i:min(i + STREAM_CHUNK, off)])
+            if out:
+                yield out
+        if off < len(data):
+            yield co.flush(zlib.Z_BLOCK)
+        prev = off
+    yield co.flush(zlib.Z_FINISH)
+
+
+def stream_matches(chunks, target: bytes) -> bool:
+    """
+    True when the chunks a compressor yields add up to exactly `target`.
+    Stops at the first chunk that disagrees, so a wrong profile usually costs
+    one block of compression instead of the whole entry.
+    """
+    pos = 0
+    try:
+        for c in chunks:
+            if target[pos:pos + len(c)] != c:
+                return False
+            pos += len(c)
+        return pos == len(target)
+    finally:
+        close = getattr(chunks, 'close', None)
+        if close:
+            close()
+
+
+def matching_prefix(chunks, target: bytes) -> int:
+    """How many leading bytes of `target` the compressor reproduces (early exit)."""
+    pos = 0
+    try:
+        for c in chunks:
+            n = len(c)
+            if target[pos:pos + n] != c:
+                return pos + _common_prefix(c, target[pos:pos + n])
+            pos += n
+        return pos
+    finally:
+        close = getattr(chunks, 'close', None)
+        if close:
+            close()
+
+
 def compress_with_breaks(data: bytes, breaks=(), level: int = 5,
                          memlevel: int = 8, strategy: int = 0) -> bytes:
     """
@@ -221,9 +311,72 @@ def compress_with_breaks(data: bytes, breaks=(), level: int = 5,
     return b''.join(out)
 
 
+class _Inflater:
+    """
+    inflate() over a stream that arrives in pieces, reporting every block end.
+
+    Fed bytes are consumed exactly once, and copy() snapshots the decoder
+    (inflateCopy), so a caller can keep one decoder parked at a point it trusts
+    and try different continuations from there without re-reading the prefix.
+    That is what keeps the break fitter linear: re-reading the whole output on
+    every round made it quadratic in the number of breaks.
+    """
+
+    def __init__(self, lib, usize: int, _copy_of: "_Inflater" = None):
+        self.lib = lib
+        self.s = _ZStream()
+        if _copy_of is None:
+            # One output buffer for a decoder and all its copies. inflate()
+            # back-references its own window, not this buffer, across calls, so
+            # copies writing over each other's later output is harmless.
+            self.dst = (ctypes.c_ubyte * max(usize, 1))()
+            rc = lib.inflateInit2_(ctypes.byref(self.s), -15, b'1.2.11', ctypes.sizeof(_ZStream))
+            if rc != Z_OK:
+                raise RuntimeError(f'inflateInit2 failed: {rc}')
+            self.s.next_out = ctypes.cast(self.dst, ctypes.c_void_p)
+            self.s.avail_out = usize
+        else:
+            self.dst = _copy_of.dst
+            rc = lib.inflateCopy(ctypes.byref(self.s), ctypes.byref(_copy_of.s))
+            if rc != Z_OK:
+                raise RuntimeError(f'inflateCopy failed: {rc}')
+        self.ended = False
+
+    def copy(self) -> "_Inflater":
+        return _Inflater(self.lib, 0, _copy_of=self)
+
+    def feed(self, data) -> list:
+        """Consume `data`; return the uncompressed offset of each block end seen."""
+        ends = []
+        if self.ended or not data:
+            return ends
+        src = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        self.s.next_in = ctypes.cast(src, ctypes.c_void_p)
+        self.s.avail_in = len(data)
+        while True:
+            rc = self.lib.inflate(ctypes.byref(self.s), Z_BLOCK)
+            if rc == Z_STREAM_END:
+                self.ended = True
+                break
+            if rc == Z_BUF_ERROR:
+                break                    # needs more input than it has
+            if rc != Z_OK:
+                raise RuntimeError(f'inflate failed: {rc}')
+            if self.s.data_type & _DATA_TYPE_BLOCK_END:
+                ends.append(int(self.s.total_out))
+            if self.s.avail_in == 0:
+                break
+        self.s.next_in = None            # src goes away with this frame
+        return ends
+
+    def close(self):
+        if self.s.state:
+            self.lib.inflateEnd(ctypes.byref(self.s))
+
+
 def fit_breaks(data: bytes, target: bytes, usize: int, level: int = 5,
                memlevel: int = 8, strategy: int = 0,
-               rounds: int = FIT_ROUNDS) -> Optional[Tuple[int, ...]]:
+               rounds: Optional[int] = None) -> Optional[Tuple[int, ...]]:
     """
     Find the minimal set of forced breaks that reproduces `target` byte for byte,
     or None when this profile cannot produce it at all.
@@ -233,57 +386,110 @@ def fit_breaks(data: bytes, target: bytes, usize: int, level: int = 5,
     the lazy-match state and shifts every later boundary - so recording all of
     them produces a different stream.
 
-    The search compares the boundary list zlib currently yields against the one
-    wanted, adds the first boundary where they diverge, and repeats. Each round
-    pins down one forced break, so it converges in (number of breaks + 1) rounds
-    rather than searching any kind of space.
+    Each round confirms one break or rejects the profile, and the work of a
+    round is proportional to the stretch since the last confirmed break:
+      * the compressor state after the last confirmed break is kept, so a round
+        never recompresses what is already settled;
+      * a round stops compressing at the first byte that differs from the
+        original, which is normally within one block;
+      * our framing is read by a decoder parked at the last confirmed break
+        (see _Inflater), never by re-reading the output from its start.
+
+    No round limit is needed: every round either returns or confirms one of the
+    original's block ends, in increasing order, so there are at most
+    len(original block ends) + 1 rounds. `rounds` can still cap it.
     """
-    if not is_available():
+    lib = _load_libz()
+    if lib is None:
         return None
     try:
         want = block_ends(target, usize)
     except Exception as e:
         logging.debug(f'block_breaks: cannot scan target: {e}')
         return None
+    n = len(data)
+    tv = memoryview(target)
+    limit = len(want) + 1 if rounds is None else rounds
 
-    breaks: Tuple[int, ...] = ()
-    settled = 0          # bytes of output confirmed correct so far
-    stalls = 0
-    for _ in range(rounds):
-        try:
-            got = compress_with_breaks(data, breaks, level, memlevel, strategy)
-        except Exception as e:
-            logging.debug(f'block_breaks: emit failed: {e}')
-            return None
-        if got == target:
-            return breaks                      # verified, not merely plausible
-        try:
-            here = block_ends(got, usize)
-        except Exception:
-            return None
-        if here == want:
-            # Same framing, different bytes: the knobs are wrong, not the breaks.
-            return None
+    breaks = []
+    snap = zlib.compressobj(level, zlib.DEFLATED, -15, memlevel, strategy)
+    snap_in = 0                  # input consumed up to the last confirmed break
+    snap_len = 0                 # output produced up to it - equal to target[:snap_len]
+    parked = _Inflater(lib, usize)   # has read exactly target[:snap_len]
+    try:
+        for _ in range(limit):
+            # Resume after the last confirmed break and stop at the first difference.
+            co = snap.copy()
+            new = bytearray()        # output after target[:snap_len]
+            pos = snap_in
+            finished = False
+            diverged = False
+            while pos < n and not diverged:
+                c = co.compress(data[pos:pos + STREAM_CHUNK])
+                pos = min(pos + STREAM_CHUNK, n)
+                if c:
+                    at = snap_len + len(new)
+                    diverged = tv[at:at + len(c)] != c
+                    new += c
+            if not diverged:
+                new += co.flush(zlib.Z_FINISH)
+                finished = True
+                if snap_len + len(new) == len(target) and tv[snap_len:] == new:
+                    return tuple(breaks)
 
-        # Each accepted break should lock one more block into place. With the
-        # right knobs the agreeing prefix grows every round; with the wrong ones
-        # it stalls immediately, which is what rejects a bad profile cheaply
-        # rather than letting it run the full round budget.
-        pref = _common_prefix(got, target)
-        if pref > settled:
-            settled, stalls = pref, 0
-        else:
-            stalls += 1
-            if stalls >= 2:
-                return None
+            # Where does our framing first differ from the original's? zlib writes a
+            # block out whole when it ends, but the last few bits of the newest block
+            # can still be held back, so keep feeding input until that block's end is
+            # visible (or the input runs out) before deciding.
+            W = [w for w in want if w > snap_in]
+            probe = parked.copy()
+            try:
+                seen, fed = set(), 0
+                while True:
+                    try:
+                        seen.update(o for o in probe.feed(new[fed:]) if snap_in < o < usize)
+                    except Exception:
+                        return None
+                    fed = len(new)
+                    H = sorted(seen)
+                    k = 0
+                    while k < len(W) and k < len(H) and W[k] == H[k]:
+                        k += 1
+                    if k < len(H) or finished:
+                        break
+                    if pos < n:
+                        new += co.compress(data[pos:pos + STREAM_CHUNK])
+                        pos = min(pos + STREAM_CHUNK, n)
+                    else:
+                        new += co.flush(zlib.Z_FINISH)
+                        finished = True
+            finally:
+                probe.close()
 
-        i = next((k for k in range(min(len(here), len(want))) if here[k] != want[k]),
-                 min(len(here), len(want)))
-        if i >= len(want) or want[i] in breaks:
-            return None                        # cannot converge; give up cleanly
-        breaks = tuple(sorted(breaks + (want[i],)))
-    logging.debug(f'block_breaks: no fit after {rounds} rounds')
-    return None
+            if k >= len(W):
+                return None              # zlib ends a block the original does not: can't fix
+            if k < len(H) and H[k] < W[k]:
+                return None              # zlib ends a block sooner than the original did;
+                                         # forcing breaks can only make blocks shorter
+            if k < len(H) and H[k] == W[k]:
+                return None              # same framing, different bytes: the knobs are wrong
+            nxt = W[k]
+
+            # Force the original's block end and confirm the bytes up to it.
+            co = snap.copy()
+            piece = bytearray()
+            for i in range(snap_in, nxt, STREAM_CHUNK):
+                piece += co.compress(data[i:min(i + STREAM_CHUNK, nxt)])
+            piece += co.flush(zlib.Z_BLOCK)
+            if tv[snap_len:snap_len + len(piece)] != piece:
+                return None              # even with the break the bytes differ: wrong profile
+            breaks.append(nxt)
+            parked.feed(piece)
+            snap, snap_in, snap_len = co, nxt, snap_len + len(piece)
+        logging.debug(f'block_breaks: no fit after {limit} rounds')
+        return None
+    finally:
+        parked.close()
 
 
 def _common_prefix(a: bytes, b: bytes) -> int:

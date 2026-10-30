@@ -56,6 +56,7 @@ MSWORD_MAX_CHAIN    = 32     # inspect only 32 candidates per hash bucket
 
 Z_OK, Z_STREAM_END = 0, 1   # not exported by the Python zlib module
 _CHUNK = 1 << 16
+STREAM_CHUNK = 1 << 16   # input slice size; see iter_compress_msword
 
 
 class _ZStream(ctypes.Structure):
@@ -119,10 +120,21 @@ def compress_raw_deflate_msword(data: bytes, flush_offsets: tuple = ()) -> bytes
     extra Z_FULL_FLUSH because it handed the packager the part in more than one
     piece. They are content-dependent (Word flushes at logical XML boundaries,
     not at round buffer sizes), so they cannot be predicted - read them off the
-    original stream with detect_flush_offsets() and carry them in metadata.
+    original stream (block_breaks.flush_offsets) and carry them in metadata.
 
     Raises RuntimeError when no shared zlib is available; guard with
     is_available() if you want to skip the profile instead.
+    """
+    return b''.join(iter_compress_msword(data, flush_offsets))
+
+
+def iter_compress_msword(data: bytes, flush_offsets: tuple = ()):
+    """
+    compress_raw_deflate_msword(), yielding output as it is produced, so a
+    comparison against the original can stop at the first block that differs.
+
+    Each piece is fed in STREAM_CHUNK slices with Z_NO_FLUSH and then flushed;
+    deflate's output does not depend on how its input is sliced.
     """
     lib = _load_libz()
     if lib is None:
@@ -146,26 +158,32 @@ def compress_raw_deflate_msword(data: bytes, flush_offsets: tuple = ()) -> bytes
         # but it is what Word does, and it costs real ratio on split parts.
         bounds = list(flush_offsets) + [len(data)]
         pieces = [data[a:b] for a, b in zip([0] + bounds, bounds)]
+        plan = []
+        for pc in pieces:
+            for i in range(0, len(pc), STREAM_CHUNK):
+                plan.append((pc[i:i + STREAM_CHUNK], 0))          # Z_NO_FLUSH
+            plan.append((b'', zlib.Z_FULL_FLUSH))
+        plan.append((b'', zlib.Z_FINISH))
 
         dst = ctypes.create_string_buffer(_CHUNK)
-        out = bytearray()
-        held = []          # keep buffers alive while zlib holds pointers into them
-        plan = [(pc, zlib.Z_FULL_FLUSH) for pc in pieces] + [(b'', zlib.Z_FINISH)]
         for piece, flush in plan:
             src = ctypes.create_string_buffer(piece, max(len(piece), 1))
-            held.append(src)
             z.next_in, z.avail_in = ctypes.cast(src, ctypes.c_void_p), len(piece)
             while True:
                 z.next_out, z.avail_out = ctypes.cast(dst, ctypes.c_void_p), _CHUNK
                 rc = lib.deflate(ctypes.byref(z), flush)
-                if rc < 0:
+                if rc < 0 and not (rc == -5 and flush == 0):   # Z_BUF_ERROR: nothing to do yet
                     raise RuntimeError(f'deflate failed: {rc} ({z.msg})')
-                out += dst.raw[:_CHUNK - z.avail_out]
-                # SYNC_FLUSH is done when it stops filling the buffer;
-                # FINISH is done when it returns Z_STREAM_END.
-                if (rc == Z_STREAM_END) if flush == zlib.Z_FINISH else (z.avail_out != 0):
+                produced = _CHUNK - z.avail_out
+                if produced:
+                    yield dst.raw[:produced]
+                if flush == zlib.Z_FINISH:
+                    if rc == Z_STREAM_END:
+                        break
+                elif z.avail_out != 0:
+                    # NO_FLUSH: input consumed; FULL_FLUSH: done when the
+                    # buffer stopped filling.
                     break
-        return bytes(out)
     finally:
         lib.deflateEnd(ctypes.byref(z))
 

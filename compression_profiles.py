@@ -54,6 +54,12 @@ BY_NAME = {p['name']: p for p in PROFILES}
 # deflateTune, so mixing the two would only produce confusing failures.
 ZLIB_PROFILES = [p for p in PROFILES if p['kind'] == 'zlib']
 
+# `PROFILE fallback` (pointer_format.FALLBACK_PROFILE) rebuilds entries from
+# their preflate corrections (preflate_fallback.py). This profile only serves a
+# deflated entry the fallback could not model, or a pointer written without the
+# helper; the hash check at checkout decides whether that worked.
+FALLBACK = BY_NAME['python-docx']
+
 
 def compress_entry(data: bytes, profile: Dict, break_kind: int = BREAK_NONE,
                    breaks: Tuple[int, ...] = ()) -> bytes:
@@ -70,6 +76,32 @@ def compress_entry(data: bytes, profile: Dict, break_kind: int = BREAK_NONE,
             data, breaks if break_kind == BREAK_BLOCK else (),
             profile['level'], profile['memlevel'], profile.get('strategy', 0))
     raise ValueError(f'unknown compression profile kind: {kind}')
+
+
+def iter_compress_entry(data: bytes, profile: Dict, break_kind: int = BREAK_NONE,
+                        breaks: Tuple[int, ...] = ()):
+    """compress_entry(), yielding output as it is produced (for early exit)."""
+    kind = profile['kind']
+    if kind == 'msword':
+        return msword_compressor.iter_compress_msword(
+            data, breaks if break_kind == BREAK_FULL else ())
+    if kind == 'zlib':
+        if break_kind == BREAK_FULL:
+            raise ValueError('full-flush breaks are not supported by zlib profiles')
+        return block_breaks.iter_compress_with_breaks(
+            data, breaks if break_kind == BREAK_BLOCK else (),
+            profile['level'], profile['memlevel'], profile.get('strategy', 0))
+    raise ValueError(f'unknown compression profile kind: {kind}')
+
+
+def entry_matches(data: bytes, target: bytes, profile: Dict, break_kind: int = BREAK_NONE,
+                  breaks: Tuple[int, ...] = ()) -> bool:
+    """
+    True when `profile` reproduces `target` exactly. Stops compressing at the
+    first block that differs, so a wrong profile costs about one block.
+    """
+    return block_breaks.stream_matches(
+        iter_compress_entry(data, profile, break_kind, breaks), target)
 
 
 def describe(profile: Dict) -> str:
