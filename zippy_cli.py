@@ -13,15 +13,19 @@ git zippy - store zip-based documents (.docx, .odt, .epub) unpacked in git.
     git zippy uninstall [--local]
         Remove the filter configuration (and, inside a repository, our hooks
         and the container fetch refspecs). Documents and refs are kept.
+    git zippy track [PATTERN...] [--lfs | --lfs=EXT,EXT]
+        Add or update the .gitattributes line for each pattern (see
+        zippy_track.py); without patterns, list what is tracked.
+    git zippy untrack PATTERN...
     git zippy env           What is configured, found and missing.
     git zippy version
     git zippy verify [REV]  Every pointer at REV (HEAD) has its parts tree.
     git zippy sync [REMOTE] Merge with and push the remote parts container.
     git zippy hook post-commit | pre-push REMOTE URL   (called by the hooks)
 
-Documents opt in through .gitattributes:
+Documents opt in through .gitattributes, best written by `git zippy track`:
 
-    *.docx filter=zippy zippy-lfs=jpg,jpeg
+    *.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
 """
 
 from __future__ import annotations
@@ -98,8 +102,8 @@ def uninstall(args) -> int:
 def _warn_missing():
     import preflate_fallback
     if not preflate_fallback.is_available():
-        print(f"  note: no zippy-preflate helper; documents no profile reproduces cannot be stored "
-              f"rebuildably. Build it: {preflate_fallback.BUILD_HINT}")
+        print(f"  note: no zippy-preflate helper; parts no profile reproduces are stored as their "
+              f"original compressed bytes (larger). Build it: {preflate_fallback.BUILD_HINT}")
     if not shutil.which("git-lfs"):
         print("  note: git-lfs not found; zippy-lfs images cannot be uploaded or downloaded")
 
@@ -129,7 +133,14 @@ def env(_args) -> int:
     if not repo:
         print("(not inside a repository)")
         return 0
-    import zippy_setup, parts_container
+    import zippy_setup, parts_container, zippy_track
+    lines = zippy_track.zippy_lines(repo)
+    if not lines:
+        print("attributes  no filter=zippy pattern in .gitattributes (git zippy track \"*.docx\")")
+    for pattern, line in lines:
+        bad = zippy_track.problems(line)
+        print(f"attributes  {pattern}: " + ("ok" if not bad else
+              f"missing {' '.join(bad)} - fix with: git zippy track \"{pattern}\""))
     hdir = zippy_setup.hooks_dir(repo)
     for name in zippy_setup.HOOK_NAMES:
         state = zippy_setup.classify_hook(hdir / name) if hdir else "core.hooksPath is set"
@@ -146,6 +157,40 @@ def env(_args) -> int:
     return 0
 
 
+def track(args) -> int:
+    import zippy_track
+    repo = _repo_dir()
+    if not repo:
+        print("git zippy track: not inside a git repository", file=sys.stderr)
+        return 1
+    try:
+        patterns, lfs = zippy_track.parse_args(args)
+    except ValueError as e:
+        print(f"git zippy track: {e}", file=sys.stderr)
+        return 2
+    if not patterns:
+        lines = zippy_track.zippy_lines(repo)
+        print("Tracked by git zippy:" if lines else "Nothing is tracked by git zippy (.gitattributes)")
+        for pattern, line in lines:
+            bad = zippy_track.problems(line)
+            print(f"    {line.strip()}" + (f"    <- missing {' '.join(bad)}" if bad else ""))
+        return 0
+    for line in zippy_track.track(repo, patterns, lfs):
+        print(line)
+    return 0
+
+
+def untrack(args) -> int:
+    import zippy_track
+    repo = _repo_dir()
+    if not repo or not args:
+        print("usage: git zippy untrack PATTERN...", file=sys.stderr)
+        return 2
+    for line in zippy_track.untrack(repo, args):
+        print(line)
+    return 0
+
+
 def main(argv) -> int:
     cmd, args = (argv[1], argv[2:]) if len(argv) > 1 else ("", [])
     if cmd == "install":
@@ -154,6 +199,10 @@ def main(argv) -> int:
         return uninstall(args)
     if cmd == "env":
         return env(args)
+    if cmd == "track":
+        return track(args)
+    if cmd == "untrack":
+        return untrack(args)
     if cmd in ("version", "--version"):
         print(f"git-zippy {VERSION}")
         return 0

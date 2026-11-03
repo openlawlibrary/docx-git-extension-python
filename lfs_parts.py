@@ -24,7 +24,7 @@ WHICH PARTS
 
 Opt-in, per document path, through a git attribute on the document:
 
-    *.docx filter=zippy zippy-lfs=jpg,jpeg
+    *.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
 
 The value is a comma-separated list of part extensions; a bare `zippy-lfs`
 means jpg,jpeg. Unspecified means no part goes to LFS, which is exactly the

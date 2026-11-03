@@ -28,6 +28,12 @@ EXAMPLE
     FALLBACK preflate-rs/0.7.6
     DEFAULTS ...
     ENTRY word/document.xml time=12106 date=23898 preflate=AAAEDAAEIAE+AP8DAQQAAAQQBAQDAA4AIDDw9zrPvwsT0D2gHJ4=
+    ENTRY word/odd.xml raw=1
+
+    A document whose zip structure the lines below cannot describe is stored
+    whole; its pointer has no DEFAULTS or ENTRY lines:
+
+    PROFILE original
 
 LINES
 
@@ -41,8 +47,13 @@ LINES
     HASH <sha256>           Of the original document. Checkout refuses any
                             rebuild that does not match it.
     PROFILE <name>          The compression profile that reproduces the
-                            document (compression_profiles.py), or `fallback`
-                            when none does. Always present: smudge never guesses.
+                            document (compression_profiles.py); `fallback` when
+                            none does (entries rebuilt from preflate data or
+                            stored raw); `original` when the zip itself cannot
+                            be described (zip64, gaps, encryption, other
+                            compression methods, damaged...) and the document is
+                            stored whole at .zippy/original in the parts tree.
+                            Always present: smudge never guesses.
     FALLBACK <tool>/<ver>   Only with PROFILE fallback: what made the entries'
                             `preflate=` corrections (preflate_fallback.py). Their
                             format changes between preflate-rs releases, so
@@ -75,8 +86,13 @@ ENTRY FIELDS (all decimal unless noted)
     flush    Word: uncompressed offsets of the full flushes inside the part
     breaks   other packagers: offsets of the blocks they cut early (Z_BLOCK)
     preflate fallback: base64 of the preflate-rs corrections that rebuild this
-             deflated part from its plain bytes. Present on every deflated part
-             of a PROFILE fallback pointer that has a FALLBACK line.
+             deflated part from its plain bytes.
+    raw      raw=1: neither a profile nor preflate reproduces this part (or the
+             helper was missing); its original compressed bytes are stored at
+             .zippy/raw/<entry name> in the parts tree and copied back as they
+             are. The plain part stays in the tree too, for diffs.
+
+    An entry has at most one of flush, breaks, preflate and raw.
 
     flush and breaks are GAPS: the first number is the offset from the start
     of the part, every next one the distance from the previous. An edit in the
@@ -118,6 +134,7 @@ POINTER_NOTICE = ("placeholder - this repository stores documents unpacked with 
 
 VERSION = (1, 0)                 # what this code writes and the newest it fully understands
 FALLBACK_PROFILE = "fallback"    # PROFILE value when no known profile reproduces the document
+ORIGINAL_PROFILE = "original"    # PROFILE value when the document is stored whole
 
 BREAK_NONE, BREAK_FULL, BREAK_BLOCK = 0, 1, 2   # same values as compression_profiles
 
@@ -275,6 +292,7 @@ FIELDS = [
 FIELD_KEYS = [k for k, _, _ in FIELDS]
 BREAK_KEYS = {"flush": BREAK_FULL, "breaks": BREAK_BLOCK}
 PREFLATE_KEY = "preflate"
+RAW_KEY = "raw"
 _FALLBACK_RE = re.compile(r"[a-z0-9][a-z0-9.+-]*/[0-9A-Za-z][0-9A-Za-z.+-]*")
 
 
@@ -302,7 +320,7 @@ def _field_values(e: Dict) -> Dict[str, str]:
 
 
 def _entry_from_values(name_raw: bytes, vals: Dict[str, str], kind: int, offs,
-                       preflate: Optional[bytes] = None) -> Dict:
+                       preflate: Optional[bytes] = None, raw: bool = False) -> Dict:
     p = {key: dec(vals[key]) for key, _, (_, dec) in FIELDS}
     flags = p["flags"]
     try:
@@ -321,7 +339,7 @@ def _entry_from_values(name_raw: bytes, vals: Dict[str, str], kind: int, offs,
                "extra_cd": p["cextra"], "comment": p["comment"]},
         "policy": {"use_data_descriptor": p["dd"] > 0, "dd_has_signature": p["dd"] == 2,
                    "flush_offsets": tuple(offs), "break_kind": kind if offs else BREAK_NONE,
-                   "preflate": preflate},
+                   "preflate": preflate, "raw": raw},
     }
 
 
@@ -352,6 +370,9 @@ def write(tree_oid: str, doc_hash: str, profile: str, entries: List[Dict],
     """
     if fallback is not None and (profile != FALLBACK_PROFILE or not _FALLBACK_RE.fullmatch(fallback)):
         raise PointerError(f"bad FALLBACK {fallback!r} for PROFILE {profile!r}")
+    if profile == ORIGINAL_PROFILE:
+        return "\n".join([f"{POINTER_MAGIC} {POINTER_NOTICE}", f"VERSION {format_version()}",
+                          f"TREE {tree_oid}", f"HASH {doc_hash}", f"PROFILE {profile}"]) + "\n"
     if not entries:
         raise PointerError("a document without zip entries cannot be recorded")
     rows = [_field_values(e) for e in entries]
@@ -374,6 +395,10 @@ def write(tree_oid: str, doc_hash: str, profile: str, entries: List[Dict],
             if not fallback:
                 raise PointerError("preflate corrections without a FALLBACK line")
             parts.append(f"{PREFLATE_KEY}={encode_b64(pol['preflate'])}")
+        if pol.get("raw"):
+            if pol["flush_offsets"] or pol.get("preflate") is not None:
+                raise PointerError(f"raw entry {e['name']!r} also has breaks or preflate data")
+            parts.append(f"{RAW_KEY}=1")
         lines.append("ENTRY " + " ".join(parts))
     return "\n".join(lines) + "\n"
 
@@ -446,7 +471,7 @@ def parse(text: str) -> Pointer:
             if defaults is None:
                 raise PointerError(f"line {n}: ENTRY before DEFAULTS")
             name, *items = rest.split(" ")
-            vals, kind, offs, seen, pre = dict(defaults), BREAK_NONE, (), set(), None
+            vals, kind, offs, seen, pre, raw = dict(defaults), BREAK_NONE, (), set(), None, False
             for kv in items:
                 k, eq, v = kv.partition("=")
                 if not eq or k in seen:
@@ -460,11 +485,15 @@ def parse(text: str) -> Pointer:
                     kind, offs = BREAK_KEYS[k], decode_gaps(v)
                 elif k == PREFLATE_KEY:
                     pre = decode_b64(v)
+                elif k == RAW_KEY:
+                    if v != "1":
+                        raise PointerError(f"line {n}: bad raw value {v!r}")
+                    raw = True
                 else:
                     unknown(f"ENTRY key {k!r}")
-            if pre is not None and offs:
-                raise PointerError(f"line {n}: preflate together with {'flush' if kind == BREAK_FULL else 'breaks'}")
-            entries.append(_entry_from_values(decode_name(name), vals, kind, offs, pre))
+            if sum((pre is not None, bool(offs), raw)) > 1:
+                raise PointerError(f"line {n}: more than one of flush/breaks, preflate, raw")
+            entries.append(_entry_from_values(decode_name(name), vals, kind, offs, pre, raw))
         else:
             unknown(f"line {key!r}")
     for key in ("TREE", "HASH", "PROFILE"):
@@ -474,6 +503,10 @@ def parse(text: str) -> Pointer:
         raise PointerError(f"bad TREE {head['TREE']!r}")
     if not re.fullmatch(r"[0-9a-f]{64}", head["HASH"]):
         raise PointerError(f"bad HASH {head['HASH']!r}")
+    if head["PROFILE"] == ORIGINAL_PROFILE:
+        if entries or defaults is not None or archive or "FALLBACK" in head:
+            raise PointerError("PROFILE original takes no DEFAULTS, ENTRY, ARCHIVE or FALLBACK lines")
+        return Pointer(version, head["TREE"], head["HASH"], head["PROFILE"], [], None, None)
     if not entries:
         raise PointerError("pointer has no entries")
     fallback = head.get("FALLBACK")

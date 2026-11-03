@@ -26,19 +26,29 @@ Like git-lfs: install once per machine, and every repository sets itself up.
    git zippy install            # filter config in ~/.gitconfig; records that Python
    git zippy install --local    # or: only for the repository you are in
    ```
-3. Opt documents in through `.gitattributes`:
+3. Opt documents in, like `git lfs track`, and commit `.gitattributes`:
    ```
-   *.docx filter=zippy zippy-lfs=jpg,jpeg
+   git zippy track "*.docx" "*.odt" --lfs      # --lfs = jpg,jpeg,png,emf; --lfs=png,gif picks; none without
+   git add .gitattributes
    ```
+   which writes:
+   ```
+   *.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
+   ```
+   - `filter=zippy`: store the document unpacked.
+   - `merge=binary`: never merge two versions of a document line by line. Git would otherwise merge the pointer text and leave conflict markers in it, and the checkout fails. With it, a conflict keeps your version; pick one with `git checkout --ours/--theirs <file>`, then `git add`.
+   - `-text`: no line-ending conversion of pointers (`core.autocrlf` on Windows).
+   - `zippy-lfs=…`: which part types go to Git LFS (see below).
 
 That is all: the first time the filter runs in a repository - `git add`, or the checkout of a plain `git clone` - it installs the post-commit and pre-push hooks and the container fetch refspec there (`zippy_setup.py`). The hooks run `git-zippy hook <name>` through the launcher's absolute path, so they name no interpreter; a new Python only needs `git zippy install` again. A hook git-lfs wrote is replaced (ours runs git-lfs's after it); any other existing hook is left alone, with a message saying what to add to it.
 
-Other commands: `git zippy env` (what is configured, found and missing), `git zippy verify [REV]` (every pointer has its parts tree), `git zippy sync [REMOTE]` (merge and push the parts container by hand), `git zippy uninstall [--local]`, `git zippy version`.
+Other commands: `git zippy track` without patterns lists what is tracked (and flags lines missing `merge=binary` or `-text`; so does `git zippy env`), `git zippy untrack PATTERN`, `git zippy env` (what is configured, found and missing), `git zippy verify [REV]` (every pointer has its parts tree), `git zippy sync [REMOTE]` (merge and push the parts container by hand), `git zippy uninstall [--local]`, `git zippy version`.
 
 ## Structure
 - `git-zippy` (launcher) and `zippy_cli.py`: the `git zippy` commands
 - `clean_filter.py`, `smudge_filter.py`: the filter
 - `parts_container.py`: the parts container and the hook logic; `zippy_setup.py`: per-repository setup
+- `zip_layout.py`: the zip writer smudge uses and clean checks documents against; `zippy_track.py`: `git zippy track`
 - `pointer_format.py`: the pointer file; `compression_profiles.py`, `block_breaks.py`, `msword_compressor.py`: rebuilding deflate streams; `preflate_fallback.py` + `preflate-helper/`: the fallback; `lfs_parts.py`: images in Git LFS
 
 ## Parts container
@@ -109,13 +119,21 @@ cargo build --release --manifest-path preflate-helper/Cargo.toml
 
 It is found at `$ZIPPY_PREFLATE`, then `preflate-helper/target/release/`, then on `PATH`; `git zippy env` prints which one is used. One helper process handles a whole document, its parts in parallel. Clean verifies every correction by rebuilding the stream inside the helper, so nothing is recorded that would not rebuild.
 
-Without the helper, clean warns and stores the document without corrections; it will not check out byte-identical until re-added with the helper built. A part preflate cannot model is reported the same way.
+## Last resort: every document checks out
+Two tiers behind the profiles and preflate, so no document is ever stored in a state it cannot be rebuilt from:
+
+- **One part** that neither a profile nor preflate reproduces - or any fallback part on a machine without the helper - keeps its original compressed bytes, at `.zippy/raw/<entry name>` in the parts tree, next to its plain version (which stays for diffs). Its `ENTRY` line gets `raw=1`, and smudge copies the bytes back as they are. They go to LFS when the part type does. Clean says how many parts and bytes, and why.
+- **The whole document**, when the zip itself cannot be described by the pointer: zip64, encryption, other compression methods (LZMA, Deflate64, bzip2), bytes before, between or after the entries, local and central headers that disagree, duplicate or unsafe entry names, a damaged file. The pointer then says `PROFILE original`, and the file is stored as it is at `.zippy/original` in the parts tree (in LFS when the document uses LFS), with its parts still unpacked beside it for diffs when they can be read. That document costs what it would in plain git.
+
+How clean knows the zip can be described: it lays the archive out again with smudge's own writer (`zip_layout.py`), using the original compressed bytes for the compressed parts, and compares the result with the document byte for byte. No compression is involved, so this costs one pass over the bytes (about 0.04 s on a 17 MB document).
+
+Pointers depend on what clean finds: a fallback document added on a machine without the helper gets `raw=1` entries instead of `preflate=` data, and re-adding it elsewhere would change its pointer. Build the helper on every machine that adds documents; `git zippy env` shows whether it is there.
 
 ## Images in Git LFS
 Document parts can be kept in Git LFS instead of the git object store. It is opt-in per document path, with an attribute next to the filter:
 
 ```
-*.docx filter=zippy zippy-lfs=jpg,jpeg
+*.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
 ```
 
 The value lists part extensions (a bare `zippy-lfs` means `jpg,jpeg`). Without it nothing changes - pointers stay byte-identical to before.
@@ -127,8 +145,6 @@ The value lists part extensions (a bare `zippy-lfs` means `jpg,jpeg`). Without i
 In a fresh clone, `git lfs fetch --all origin` after fetching the parts container downloads every image in one batch before checkout; otherwise smudge downloads what it needs on demand. See `lfs_parts.py` for details.
 
 ## Upcoming work
-- Structural check in clean: compare local and central headers, gaps between entries, data after the archive, zip64 and other rebuild assumptions, and record (on the `ARCHIVE` line) or report what does not fit instead of failing at checkout.
-- Last-resort tier for a part preflate cannot model: keep its compressed bytes as a blob.
 - Long-running filter (`filter.zippy.process = git-zippy filter-process`), in the Rust version: the repository and pack indexes are opened once per git command instead of once per document, and git's delayed checkout lets smudge rebuild documents in parallel. (In the Python version ~0.13 s of a small document's clean is interpreter and pygit2 start-up, about an hour per 30k documents.)
 - Cache of fitted breaks and preflate corrections keyed by the compressed part's SHA-256 and the profile, so unchanged parts and repeated images skip the work on re-add and renormalize.
 - Unpack and rebuild in memory: clean writes the document to a temp folder, unpacks it and inflates every part again for the profile check (0.83 s of a 17 MB document's clean); smudge extracts the tree to a temp folder and reads it back.

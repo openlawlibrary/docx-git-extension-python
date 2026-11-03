@@ -19,10 +19,11 @@ Notes:
 """
 
 from __future__ import annotations
+import io
 from pathlib import Path
+import shutil
 import sys
 from typing import Dict, Iterable, List, Tuple
-import sys
 import tempfile
 import zipfile
 import pygit2
@@ -35,7 +36,8 @@ import lfs_parts
 import pointer_format
 import preflate_fallback
 import zippy_setup
-from utils.utils import (read_u16, read_u32, calculate_sha256, repo_from_cwd, calculate_file_sha256)
+import zip_layout
+from utils.utils import (read_u16, read_u32, calculate_sha256, repo_from_cwd)
 
 # === ZIP constants ===
 SIG_LFH   = 0x04034B50
@@ -329,51 +331,42 @@ def _fit_profile(items, deflated, raws, flushes, profile, can_scan):
 def _preflate_corrections(items: List[Dict]):
     """
     The fallback: preflate-rs corrections for every deflated entry, as
-    (fallback tool/version, {item index: corrections}). The helper verifies
-    each one by rebuilding the stream, so what is recorded does rebuild.
-
-    Without the helper, or for a stream preflate cannot model, the entry gets
-    no corrections; smudge then tries plain zlib and the hash check decides.
-    Both cases are reported here, at add time, not discovered at checkout.
+    (fallback tool/version or None, {item index: corrections}, {item index:
+    why it has none}). The helper verifies each one by rebuilding the stream,
+    so what is recorded does rebuild. Entries without corrections - preflate
+    cannot model them, or there is no helper here - are stored raw instead.
     """
     deflated = [i for i, it in enumerate(items)
                 if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
     if not deflated:
-        return None, {}
+        return None, {}, {}
     try:
         tool = preflate_fallback.version()
     except preflate_fallback.PreflateUnavailable as e:
         logging.warning(f"fallback unavailable: {e}")
-        sys.stderr.write(f"clean_filter.py: warning: no compression profile reproduces this "
-                         f"document and {e}. It is stored without fallback data and will not "
-                         f"check out byte-identical; re-add it once the helper is built.\n")
-        return None, {}
+        return None, {}, {i: f"no zippy-preflate helper here ({e})" for i in deflated}
     results = preflate_fallback.split([items[i]['comp'] for i in deflated])
-    corrections, failed = {}, []
+    corrections, failed = {}, {}
     for i, (corr, why) in zip(deflated, results):
         if corr is None:
-            failed.append(items[i]['name'])
+            failed[i] = f"preflate cannot model it: {why}"
             logging.warning(f"preflate cannot model {items[i]['name']}: {why}")
         else:
             corrections[i] = corr
     logging.info(f"Fallback {tool}: {len(corrections)} of {len(deflated)} deflated entries, "
                  f"{sum(map(len, corrections.values()))} bytes of corrections")
-    if failed:
-        sys.stderr.write(f"clean_filter.py: warning: the fallback cannot model "
-                         f"{', '.join(failed)}; this document will not check out "
-                         f"byte-identical\n")
-    return tool, corrections
+    return tool, corrections, failed
 
 
-def pointer_entries(items: List[Dict], breaks, corrections=None) -> List[Dict]:
-    """The pointer's entry list: each entry with its breaks or fallback corrections."""
+def pointer_entries(items: List[Dict], breaks, corrections=None, raw=()) -> List[Dict]:
+    """The pointer's entry list: each entry with its breaks, fallback corrections or raw flag."""
     corrections = corrections or {}
     out = []
     for i, (it, (kind, offs)) in enumerate(zip(items, breaks)):
         e = dict(it['entry'])
         e['policy'] = dict(e['policy'], flush_offsets=tuple(offs),
                            break_kind=kind if offs else compression_profiles.BREAK_NONE,
-                           preflate=corrections.get(i))
+                           preflate=corrections.get(i), raw=i in raw)
         logging.debug(
             f"entry {it['name']!r}: method={it['method']} dir={it['is_dir']} "
             f"gpf=0x{it['gpf']:04x} comp={len(it['comp'])} uncomp={it['usize']} "
@@ -384,74 +377,147 @@ def pointer_entries(items: List[Dict], breaks, corrections=None) -> List[Dict]:
     return out
 
 
-def build_pointer(b: bytes, tree_oid: str, docx_hash: str) -> str:
+def _check_container(buf: bytes, items: List[Dict], parts_dir: Path, comment: bytes):
     """
-    The pointer text for document bytes `b`. Takes the document's bytes so the
-    entry list cannot disagree with the tree built from those same bytes.
+    None when smudge's zip writer, given the original compressed bytes, writes
+    exactly `buf`; otherwise why not. No compression - one pass over the bytes.
     """
-    cd_off, cd_size = find_eocd(b)
-    logging.debug(f"EOCD: central directory at {cd_off}, {cd_size} bytes")
-    items = _collect_entries(b, cd_off, cd_size)
+    by_id = {id(it['entry']): it for it in items}
+
+    def part(entry):
+        it = by_id[id(entry)]
+        if it['is_dir']:
+            return zip_layout.dir_data(it['method']), 0, 0
+        data = (parts_dir / entry['name']).read_bytes()
+        return (data if it['method'] == METHOD_STORE else it['comp'],
+                zlib.crc32(data) & 0xFFFFFFFF, len(data))
+    try:
+        rebuilt = zip_layout.write_archive([it['entry'] for it in items], part, comment)
+    except Exception as e:
+        return f"its zip layout cannot be written back ({e})"
+    if rebuilt != buf:
+        off = zip_layout.first_difference(rebuilt, buf)
+        return (f"its zip layout differs from what the pointer can describe "
+                f"(first difference at byte {off} of {len(buf)})")
+    return None
+
+
+def plan_document(buf: bytes, parts_dir: Path) -> Dict:
+    """
+    Unpack `buf` into `parts_dir` and decide how the document is stored:
+    mode 'pointer' (profile or fallback, some entries possibly raw) or mode
+    'original' (stored whole), with the reason.
+    """
+    def original(reason):
+        return {'mode': 'original', 'reason': reason}
+    try:
+        cd_off, cd_size = find_eocd(buf)
+        items = _collect_entries(buf, cd_off, cd_size)
+        with zipfile.ZipFile(io.BytesIO(buf)) as z:
+            z.extractall(parts_dir)
+    except Exception as e:
+        return original(f"it is not a zip this extension can read ({e})")
+    if not items:
+        return original("it has no zip entries")
+    for it in items:
+        if not zip_layout.safe_name(it['name']):
+            return original(f"entry name {it['name']!r} cannot be stored as a part")
+        if it['method'] not in (METHOD_STORE, METHOD_DEFLATE):
+            return original(f"entry {it['name']!r} uses compression method {it['method']}")
+        if it['gpf'] & GPF_ENCRYPTED:
+            return original(f"entry {it['name']!r} is encrypted")
+    comment = archive_comment(buf)
+    why = _check_container(buf, items, parts_dir, comment)
+    if why:
+        return original(why)
 
     profile_name, breaks = _choose_profile(items)
+    # A deflated entry with no compressed bytes at all is not a deflate stream
+    # anything can reproduce; keep its (empty) bytes.
+    raw = {i: "it has no deflate data" for i, it in enumerate(items)
+           if it['method'] == METHOD_DEFLATE and not it['is_dir'] and not it['comp']}
     fallback, corrections = None, {}
     if profile_name:
-        # Recorded always, so smudge never has to search: it rebuilds once,
-        # with exactly this profile.
         logging.info(f"Recording compression profile: {profile_name}")
     else:
         profile_name = pointer_format.FALLBACK_PROFILE
-        fallback, corrections = _preflate_corrections(items)
+        fallback, corrections, failed = _preflate_corrections(items)
+        raw.update(failed)
+    return {'mode': 'pointer', 'items': items, 'profile': profile_name, 'breaks': breaks,
+            'fallback': fallback if corrections else None, 'corrections': corrections,
+            'raw': raw, 'comment': comment}
 
-    entries = pointer_entries(items, breaks, corrections)
-    n = sum(1 for _, offs in breaks if offs)
-    logging.info(f"{len(entries)} entries, {n} with breaks, profile {profile_name}")
-    comment = archive_comment(b)
-    if comment:
-        logging.info(f"Archive comment: {len(comment)} bytes")
-    return pointer_format.write(tree_oid, docx_hash, profile_name, entries,
-                                fallback if corrections else None, comment)
 
-def add_directory_to_tree(repo, base_path, tree_builder, lfs_extensions=frozenset()):
+def add_directory_to_tree(repo, base_path, tree_builder, lfs_extensions=frozenset(), rel=""):
     """
     Create a git tree from a directory.
 
     Parts whose extension is in `lfs_extensions` go to the local LFS store and
-    the tree holds their LFS pointer instead; see lfs_parts.py.
+    the tree holds their LFS pointer instead; see lfs_parts.py. So does a whole
+    document stored at .zippy/original when the document uses LFS at all.
     """
     for entry in sorted(base_path.iterdir()):
+        path = f"{rel}{entry.name}"
         if entry.is_file():
-            data = lfs_parts.blob_for_part(repo, entry.name, entry.read_bytes(),
-                                           lfs_extensions)
+            data = entry.read_bytes()
+            if path == zip_layout.ORIGINAL and lfs_extensions and data:
+                data = lfs_parts.store(repo, data)
+            else:
+                data = lfs_parts.blob_for_part(repo, entry.name, data, lfs_extensions)
             blob_oid = repo.create_blob(data)
             tree_builder.insert(entry.name, blob_oid, pygit2.GIT_FILEMODE_BLOB)
         elif entry.is_dir():
             sub_builder = repo.TreeBuilder()
-            add_directory_to_tree(repo, entry, sub_builder, lfs_extensions)
+            add_directory_to_tree(repo, entry, sub_builder, lfs_extensions, path + "/")
             subtree_oid = sub_builder.write()
             tree_builder.insert(entry.name, subtree_oid, pygit2.GIT_FILEMODE_TREE)
 
-def save_docx_as_git_tree(repo, docx_bytes, lfs_extensions=frozenset()) -> pygit2.Oid:
+
+def store_document(repo, buf: bytes, doc_hash: str, lfs_extensions=frozenset(),
+                   display: str = "document") -> Tuple[str, str]:
     """
-    Unzip a docx file and store its xml components in a git tree.
-    Retruns git tree oid.
+    Store the document's parts as a git tree and return (tree oid, pointer).
+    Built completely before anything reaches stdout.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        docx_path = tmp_path / "file.docx"
-        docx_path.write_bytes(docx_bytes)
+        parts_dir = Path(tmpdir) / "parts"
+        parts_dir.mkdir()
+        plan = plan_document(buf, parts_dir)
+        if plan['mode'] == 'original':
+            logging.warning(f"{display}: stored whole: {plan['reason']}")
+            sys.stderr.write(f"[zippy] {display}: stored whole, not unpacked for rebuilding, "
+                             f"because {plan['reason']}\n")
+            if (parts_dir / zip_layout.RESERVED).exists():
+                # The document has parts of its own under .zippy/: keep only the original.
+                shutil.rmtree(parts_dir)
+                parts_dir.mkdir()
+            target = parts_dir / zip_layout.ORIGINAL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(buf)
+        else:
+            items = plan['items']
+            for i in plan['raw']:
+                target = parts_dir / zip_layout.RAW_DIR / items[i]['name']
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(items[i]['comp'])
+            if plan['raw']:
+                size = sum(len(items[i]['comp']) for i in plan['raw'])
+                reasons = sorted(set(plan['raw'].values()))
+                sys.stderr.write(f"[zippy] {display}: {len(plan['raw'])} part(s) stored as their "
+                                 f"original compressed bytes ({size:,} bytes): "
+                                 f"{'; '.join(reasons)}\n")
+        builder = repo.TreeBuilder()
+        add_directory_to_tree(repo, parts_dir, builder, lfs_extensions)
+        tree_oid = str(builder.write())
 
-        with zipfile.ZipFile(docx_path, "r") as zip_ref:
-            names = zip_ref.namelist()
-            zip_ref.extractall(tmp_path / "unzipped")
-        logging.debug(f"Unpacked {len(names)} zip members: {', '.join(sorted(names))}")
+    if plan['mode'] == 'original':
+        return tree_oid, pointer_format.write(tree_oid, doc_hash, pointer_format.ORIGINAL_PROFILE, [])
+    entries = pointer_entries(plan['items'], plan['breaks'], plan['corrections'], plan['raw'])
+    logging.info(f"{len(entries)} entries, profile {plan['profile']}, "
+                 f"{len(plan['corrections'])} with preflate data, {len(plan['raw'])} raw")
+    return tree_oid, pointer_format.write(tree_oid, doc_hash, plan['profile'], entries,
+                                          plan['fallback'], plan['comment'])
 
-        tree_builder = repo.TreeBuilder()
-        add_directory_to_tree(repo, tmp_path / "unzipped", tree_builder, lfs_extensions)
-
-        tree_oid = tree_builder.write()
-        logging.info(f"Stored {len(names)} parts as tree {tree_oid}")
-        return tree_oid
 
 def main():
     logging.info("clean_filter.py started")
@@ -500,13 +566,11 @@ def main():
     lfs_extensions = lfs_parts.extensions_for(repo, str(docx_path).replace("\\", "/"))
     if lfs_extensions:
         logging.info(f"Parts with extensions {sorted(lfs_extensions)} go to LFS")
-    tree_oid = save_docx_as_git_tree(repo, docx_bytes, lfs_extensions)
     docx_hash = calculate_sha256(docx_bytes)
-    logging.info(f"Document SHA256={docx_hash}, parts tree {tree_oid}")
-
     # Built completely before anything reaches stdout, so a failure can never
     # leave git holding half a pointer.
-    pointer = build_pointer(docx_bytes, str(tree_oid), docx_hash)
+    tree_oid, pointer = store_document(repo, docx_bytes, docx_hash, lfs_extensions, str(docx_path))
+    logging.info(f"Document SHA256={docx_hash}, parts tree {tree_oid}")
     sys.stdout.write(pointer)
     logging.info(f"Wrote pointer for {docx_path}: tree={tree_oid} hash={docx_hash}")
 

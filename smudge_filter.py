@@ -7,9 +7,7 @@ recompresses every entry with the one profile the pointer records and refuses
 the result unless its SHA-256 matches the pointer's HASH.
 """
 from __future__ import annotations
-import io
 from pathlib import Path
-import struct
 import sys
 import zlib
 from typing import Dict, List, Tuple
@@ -23,15 +21,12 @@ import parts_container
 import pointer_format
 import preflate_fallback
 import zippy_setup
+import zip_layout
 from utils.utils import calculate_sha256
 
-# Smudge only writes zips; reading them is the clean filter's job.
-SIG_LFH   = 0x04034B50
-SIG_CFH   = 0x02014B50
-SIG_EOCD  = 0x06054B50
-SIG_DD    = 0x08074B50
-METHOD_STORE = 0
-METHOD_DEFLATE = 8
+# Smudge only writes zips (zip_layout.py); reading them is the clean filter's job.
+METHOD_STORE = zip_layout.METHOD_STORE
+METHOD_DEFLATE = zip_layout.METHOD_DEFLATE
 
 log_path = Path.cwd() / "zippy_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
@@ -69,123 +64,38 @@ def build_docx_bytes(input_dir: Path, entries: List[Dict], profile: Dict,
                      archive_comment: bytes = b"") -> bytes:
     """
     Build the archive in memory from the extracted parts and the pointer's
-    entry list, compressing DEFLATE entries with `profile` - or, for entries
-    that carry fallback corrections, rebuilding them with preflate (all of a
-    document's in one helper call, before the archive is written).
+    entry list (zip_layout.write_archive lays it out). Each deflated entry is
+    compressed with `profile`, rebuilt from its preflate corrections (all of a
+    document's in one helper call), or - raw=1 - copied from .zippy/raw/.
     """
     rebuilt = _preflate_streams(input_dir, entries)
 
-    out = io.BytesIO()
-    cd_records: List[bytes] = []
-
-    for ent in entries:
-        name_raw: bytes = ent['name_raw']
-        name_str: str = ent['name']
-        is_dir: bool = ent['is_dir']
-        lfh = ent['lfh']
-        cd  = ent['cd']
-        pol = ent['policy']
-
-        lfh_off = out.tell()
-
-        if is_dir:
-            raw = b''
-        else:
-            src_path = (input_dir / name_str)
-            if not src_path.is_file():
-                raise FileNotFoundError(f'Missing input file for entry: {name_str}')
-            raw = src_path.read_bytes()
-
+    def part(ent):
+        name, lfh, pol = ent['name'], ent['lfh'], ent['policy']
+        if ent['is_dir']:
+            return zip_layout.dir_data(lfh['method']), 0, 0
+        src = input_dir / name
+        if not src.is_file():
+            raise FileNotFoundError(f'Missing input file for entry: {name}')
+        raw = src.read_bytes()
         crc32 = zlib.crc32(raw) & 0xFFFFFFFF
         if lfh['method'] == METHOD_STORE:
             comp = raw
-        elif lfh['method'] == METHOD_DEFLATE and id(ent) in rebuilt:
+        elif lfh['method'] != METHOD_DEFLATE:
+            raise ValueError(f'Unsupported method {lfh["method"]} for {name}')
+        elif pol.get('raw'):
+            stored = input_dir / zip_layout.RAW_DIR / name
+            if not stored.is_file():
+                raise FileNotFoundError(f'Missing raw bytes for entry: {name}')
+            comp = stored.read_bytes()
+        elif id(ent) in rebuilt:
             comp = rebuilt[id(ent)]
-        elif lfh['method'] == METHOD_DEFLATE:
+        else:
             comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()),
                                          pol.get('break_kind', compression_profiles.BREAK_NONE))
-        else:
-            raise ValueError(f'Unsupported method {lfh["method"]} for {name_str}')
+        return comp, crc32, len(raw)
 
-        uncomp_size = len(raw)
-        comp_size   = len(comp)
-        if comp_size >= 0xFFFFFFFF or uncomp_size >= 0xFFFFFFFF:
-            raise ValueError('ZIP64 not supported in builder (sizes exceed 4 GiB)')
-
-        use_dd = bool(pol.get('use_data_descriptor', False))
-        dd_has_sig = bool(pol.get('dd_has_signature', False))
-
-        l_crc32 = 0 if use_dd else crc32
-        l_comp  = 0 if use_dd else comp_size
-        l_uncomp= 0 if use_dd else uncomp_size
-
-        lfh_hdr = struct.pack(
-            '<IHHHHHIIIHH',
-            SIG_LFH,
-            lfh['version_needed'],
-            lfh['flags'],
-            lfh['method'],
-            lfh['dos_time'],
-            lfh['dos_date'],
-            l_crc32,
-            l_comp,
-            l_uncomp,
-            len(name_raw),
-            len(lfh['extra_lfh']),
-        )
-        out.write(lfh_hdr)
-        out.write(name_raw)
-        out.write(lfh['extra_lfh'])
-
-        out.write(comp)
-
-        if use_dd:
-            if dd_has_sig:
-                out.write(struct.pack('<I', SIG_DD))
-            out.write(struct.pack('<III', crc32, comp_size, uncomp_size))
-
-        cfh = struct.pack(
-            '<IHHHHHHIIIHHHHHII',
-            SIG_CFH,
-            cd['version_made_by'],
-            cd.get('version_needed', lfh['version_needed']),
-            lfh['flags'],
-            lfh['method'],
-            cd.get('dos_time', lfh['dos_time']),
-            cd.get('dos_date', lfh['dos_date']),
-            crc32,
-            comp_size,
-            uncomp_size,
-            len(name_raw),
-            len(cd['extra_cd']),
-            len(cd['comment']),
-            0,
-            cd.get('internal_attr', 0),
-            cd.get('external_attr', 0),
-            lfh_off,
-        )
-        cd_records.append(cfh + name_raw + cd['extra_cd'] + cd['comment'])
-
-    cd_start = out.tell()
-    for rec in cd_records:
-        out.write(rec)
-    cd_size = out.tell() - cd_start
-
-    total_entries = len(cd_records)
-    eocd = struct.pack(
-        '<IHHHHIIH',
-        SIG_EOCD,
-        0,
-        0,
-        total_entries,
-        total_entries,
-        cd_size,
-        cd_start,
-        len(archive_comment),
-    )
-    out.write(eocd)
-    out.write(archive_comment)
-    return out.getvalue()
+    return zip_layout.write_archive(entries, part, archive_comment)
 
 def repo_from_cwd():
     """
@@ -237,6 +147,8 @@ def profile_for(profile_name):
     reproduces the document. A name this version does not know is an error,
     not a reason to guess: the pointer was written by a newer extension.
     """
+    if profile_name == pointer_format.ORIGINAL_PROFILE:
+        return {"name": profile_name, "kind": "original"}
     if profile_name == pointer_format.FALLBACK_PROFILE:
         # Entries with preflate corrections are rebuilt from those; this zlib
         # profile only serves deflated entries the fallback could not model.
@@ -318,9 +230,16 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
         tmp_path = Path(tmpdir)
         extract_tree(repo, tree, tmp_path)
 
-        # Compress folder to recreate the original docx:
-        docx_bytes, profile, meta = recompress_docx(tmp_path, ptr.entries, profile_def,
-                                                    ptr.archive.get('comment', b''))
+        if profile_def["kind"] == "original":
+            # Stored whole: nothing to rebuild, the hash check still applies.
+            stored = tmp_path / zip_layout.ORIGINAL
+            if not stored.is_file():
+                raise FileNotFoundError(f"parts tree {tree_oid} has no {zip_layout.ORIGINAL}")
+            docx_bytes, profile = stored.read_bytes(), profile_def["name"]
+            meta = {"level": None, "memLevel": None, "sha": calculate_sha256(docx_bytes)}
+        else:
+            docx_bytes, profile, meta = recompress_docx(tmp_path, ptr.entries, profile_def,
+                                                        ptr.archive.get('comment', b''))
 
         # Log outcome
         logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
