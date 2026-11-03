@@ -15,17 +15,18 @@ those parts itself, and leaves only the network to git-lfs:
            and only an object that is not there is fetched, by `git lfs smudge`.
            That is the one place git-lfs runs, so its endpoint, credentials and
            transfer settings (.lfsconfig, credential helper) apply unchanged.
-  push   - nothing here. `git lfs pre-push` already scans every commit being
-           pushed - refs/docx/* included - for pointer blobs by content and
-           uploads what the server lacks.
+  push   - nothing here. The pre-push hook pushes the parts container
+           (refs/zippy/parts, see parts_container.py) through a nested push,
+           and `git lfs pre-push` scans its new commits for pointer blobs by
+           content and uploads what the server lacks - before the branch goes.
 
 WHICH PARTS
 
 Opt-in, per document path, through a git attribute on the document:
 
-    *.docx filter=docx docx-lfs=jpg,jpeg
+    *.docx filter=zippy zippy-lfs=jpg,jpeg
 
-The value is a comma-separated list of part extensions; a bare `docx-lfs`
+The value is a comma-separated list of part extensions; a bare `zippy-lfs`
 means jpg,jpeg. Unspecified means no part goes to LFS, which is exactly the
 behaviour before this module existed, so documents that do not opt in keep
 the pointers they already have.
@@ -61,7 +62,7 @@ POINTER_VERSION = b"version https://git-lfs.github.com/spec/v1\n"
 # git-lfs never treats anything larger than this as a pointer.
 MAX_POINTER_SIZE = 1024
 
-ATTRIBUTE = "docx-lfs"
+ATTRIBUTE = "zippy-lfs"
 DEFAULT_EXTENSIONS = frozenset({"jpg", "jpeg"})
 
 _OID_RE = re.compile(rb"^oid sha256:([0-9a-f]{64})$")
@@ -152,7 +153,7 @@ def store(repo, data: bytes) -> bytes:
 # --- clean side -------------------------------------------------------------
 
 def extensions_for(repo, doc_path: str) -> Set[str]:
-    """Part extensions this document sends to LFS, from its docx-lfs attribute."""
+    """Part extensions this document sends to LFS, from its zippy-lfs attribute."""
     try:
         value = repo.get_attr(doc_path, ATTRIBUTE)
     except Exception as e:
@@ -160,7 +161,7 @@ def extensions_for(repo, doc_path: str) -> Set[str]:
         return set()
     if value is True:
         return set(DEFAULT_EXTENSIONS)
-    if not value:  # None (unspecified) or False (-docx-lfs)
+    if not value:  # None (unspecified) or False (-zippy-lfs)
         return set()
     return {e.strip().lower().lstrip(".") for e in str(value).split(",") if e.strip()}
 

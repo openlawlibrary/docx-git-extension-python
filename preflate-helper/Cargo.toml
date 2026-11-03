@@ -1,13 +1,13 @@
 [package]
-name = "docx-preflate"
+name = "zippy-preflate"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Fallback compression for the docx git extension: split deflate streams into plain data + preflate-rs corrections, and recreate them byte for byte"
+description = "Fallback compression for git-zippy: split deflate streams into plain data + preflate-rs corrections, and recreate them byte for byte"
 license = "Apache-2.0"
 
 [[bin]]
-name = "docx-preflate"
+name = "zippy-preflate"
 path = "src/main.rs"
 
 [dependencies]

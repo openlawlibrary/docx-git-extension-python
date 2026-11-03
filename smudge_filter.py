@@ -19,8 +19,10 @@ import logging
 import compression_profiles
 import msword_compressor
 import lfs_parts
+import parts_container
 import pointer_format
 import preflate_fallback
+import zippy_setup
 from utils.utils import calculate_sha256
 
 # Smudge only writes zips; reading them is the clean filter's job.
@@ -31,7 +33,7 @@ SIG_DD    = 0x08074B50
 METHOD_STORE = 0
 METHOD_DEFLATE = 8
 
-log_path = Path.cwd() / "docx_smudge.log"
+log_path = Path.cwd() / "zippy_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 
 def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = (),
@@ -289,14 +291,20 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
         # The corrections only mean something to the preflate-rs that made them.
         have = preflate_fallback.version()           # raises when the helper is missing
         if have != ptr.fallback:
-            raise RuntimeError(f"pointer was written with {ptr.fallback} but the docx-preflate "
+            raise RuntimeError(f"pointer was written with {ptr.fallback} but the zippy-preflate "
                                f"helper here is {have}; build the matching helper")
+    if tree_oid not in repo:
+        # Typically a `git pull origin <branch>`, which does not fetch the
+        # parts container: fetch it now rather than fail the checkout.
+        if parts_container.fetch_for_tree(repo, tree_oid):
+            repo = pygit2.Repository(repo.path)
     try:
         obj = repo[tree_oid]
     except (KeyError, ValueError) as e:
         raise LookupError(
-            f"parts tree {tree_oid} is not in this repository ({e}). The clone may "
-            f"be missing refs/docx/*; run install.py and 'git fetch'.") from e
+            f"parts tree {tree_oid} is not in this repository ({e}), nor in the remote "
+            f"parts container. Check 'git zippy env', then 'git fetch'; if that does "
+            f"not help, it was never pushed.") from e
 
     if isinstance(obj, pygit2.Tree):
         tree = obj
@@ -332,7 +340,7 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
         # tells you nothing about which file just went past.
         logging.info(f"Smudged {path}: profile={profile}, tree={tree_oid}")
         # Debug printout to console; stderr because stdout carries the document.
-        sys.stderr.write(f"[docx smudge] {path}: profile={profile}\n")
+        sys.stderr.write(f"[zippy smudge] {path}: profile={profile}\n")
         sys.stdout.buffer.write(docx_bytes)
 
 def main():
@@ -347,7 +355,7 @@ def main():
     # byte for byte.
     data = sys.stdin.buffer.read()
     if not pointer_format.is_pointer(data):
-        logging.info("Not a docx pointer (%d bytes); passing through unchanged", len(data))
+        logging.info("Not a zippy pointer (%d bytes); passing through unchanged", len(data))
         sys.stdout.buffer.write(data)
         return
 
@@ -360,6 +368,7 @@ def main():
 
     try:
         repo = repo_from_cwd()
+        zippy_setup.ensure_repo(repo.workdir or Path.cwd())     # once per repository
         recreate_docx(repo, ptr, path)
     except Exception as e:
         logging.exception(f"Unhandled exception: {e}")

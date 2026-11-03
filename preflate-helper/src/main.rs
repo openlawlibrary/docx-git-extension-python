@@ -1,4 +1,4 @@
-//! docx-preflate - the fallback compression of the docx git extension.
+//! zippy-preflate - the fallback compression of git-zippy.
 //!
 //! When no known compression profile reproduces a document, the clean filter
 //! hands every deflated part to `split`, which records what preflate-rs needs
@@ -7,9 +7,9 @@
 //! plus corrections to `recreate` and gets the original streams back.
 //!
 //! USAGE
-//!     docx-preflate version      prints `preflate-rs/<version>`
-//!     docx-preflate split        stdin: frames of raw deflate streams
-//!     docx-preflate recreate     stdin: frame pairs (plain part, corrections)
+//!     zippy-preflate version      prints `preflate-rs/<version>`
+//!     zippy-preflate split        stdin: frames of raw deflate streams
+//!     zippy-preflate recreate     stdin: frame pairs (plain part, corrections)
 //!
 //! FRAMING (all integers u32 little endian)
 //!     request frame   len, bytes
@@ -120,18 +120,18 @@ fn main() {
         return;
     }
     if cmd != "split" && cmd != "recreate" {
-        eprintln!("usage: docx-preflate version | split | recreate   (frames on stdin, see source)");
+        eprintln!("usage: zippy-preflate version | split | recreate   (frames on stdin, see source)");
         std::process::exit(2);
     }
     let mut input = Vec::new();
     if let Err(e) = io::stdin().read_to_end(&mut input) {
-        eprintln!("docx-preflate: cannot read stdin: {e}");
+        eprintln!("zippy-preflate: cannot read stdin: {e}");
         std::process::exit(1);
     }
     let frames = match read_frames(&input) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("docx-preflate: {e}");
+            eprintln!("zippy-preflate: {e}");
             std::process::exit(1);
         }
     };
@@ -139,13 +139,13 @@ fn main() {
         parallel(frames.len(), |i| split(frames[i]))
     } else {
         if frames.len() % 2 != 0 {
-            eprintln!("docx-preflate: recreate needs (plain, corrections) frame pairs");
+            eprintln!("zippy-preflate: recreate needs (plain, corrections) frame pairs");
             std::process::exit(1);
         }
         parallel(frames.len() / 2, |i| recreate(frames[2 * i], frames[2 * i + 1]))
     };
     if let Err(e) = write_replies(replies) {
-        eprintln!("docx-preflate: cannot write stdout: {e}");
+        eprintln!("zippy-preflate: cannot write stdout: {e}");
         std::process::exit(1);
     }
 }

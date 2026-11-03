@@ -34,6 +34,7 @@ import msword_compressor
 import lfs_parts
 import pointer_format
 import preflate_fallback
+import zippy_setup
 from utils.utils import (read_u16, read_u32, calculate_sha256, repo_from_cwd, calculate_file_sha256)
 
 # === ZIP constants ===
@@ -52,7 +53,7 @@ METHOD_DEFLATE = 8
 # the post-commit hook repeats the prefix because it must stay self-contained.
 POINTER_MAGIC = pointer_format.POINTER_MAGIC
 
-log_path = Path.cwd() / "docx_clean.log"
+log_path = Path.cwd() / "zippy_clean.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 
 def _eocd_offset(buf: bytes) -> int:
@@ -491,8 +492,11 @@ def main():
         sys.exit(1)
 
     repo = repo_from_cwd()
+    # First filter run in this repository: install its hooks and container
+    # fetch refspec (once; see zippy_setup.py).
+    zippy_setup.ensure_repo(repo.workdir or Path.cwd())
     # Which parts go to LFS is a property of the document's path, set in
-    # .gitattributes (docx-lfs=jpg,jpeg). Unset means none, as before.
+    # .gitattributes (zippy-lfs=jpg,jpeg). Unset means none, as before.
     lfs_extensions = lfs_parts.extensions_for(repo, str(docx_path).replace("\\", "/"))
     if lfs_extensions:
         logging.info(f"Parts with extensions {sorted(lfs_extensions)} go to LFS")

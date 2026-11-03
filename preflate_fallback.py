@@ -10,12 +10,12 @@ prediction, the "corrections" (typically 40-80 bytes per part). From the plain
 part plus those corrections it rebuilds the original stream byte for byte.
 
 preflate-rs is Rust, so it runs in a small helper, preflate-helper/
-(docx-preflate). Build it once:
+(zippy-preflate). Build it once:
 
     cargo build --release --manifest-path preflate-helper/Cargo.toml
 
-Found, in this order: $DOCX_PREFLATE, preflate-helper/target/release next to
-this file, then docx-preflate on PATH. One helper process per document; it
+Found, in this order: $ZIPPY_PREFLATE, preflate-helper/target/release next to
+this file, then zippy-preflate on PATH. One helper process per document; it
 works on the document's parts in parallel.
 
 VERSIONS. The corrections format is not stable across preflate-rs releases, so
@@ -33,8 +33,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-ENV_VAR = "DOCX_PREFLATE"
-_EXE = "docx-preflate.exe" if os.name == "nt" else "docx-preflate"
+ENV_VAR = "ZIPPY_PREFLATE"
+_EXE = "zippy-preflate.exe" if os.name == "nt" else "zippy-preflate"
 _BUILT = Path(__file__).resolve().parent / "preflate-helper" / "target" / "release" / _EXE
 BUILD_HINT = "cargo build --release --manifest-path preflate-helper/Cargo.toml"
 
@@ -44,7 +44,7 @@ _version: Optional[str] = None
 
 
 class PreflateUnavailable(RuntimeError):
-    """No usable docx-preflate helper on this machine."""
+    """No usable zippy-preflate helper on this machine."""
 
 
 def helper_path() -> Optional[str]:
@@ -57,7 +57,7 @@ def helper_path() -> Optional[str]:
         elif _BUILT.is_file():
             _helper = str(_BUILT)
         else:
-            _helper = shutil.which("docx-preflate")
+            _helper = shutil.which("zippy-preflate")
     return _helper
 
 
@@ -68,12 +68,12 @@ def version() -> str:
         exe = helper_path()
         if not exe:
             raise PreflateUnavailable(
-                f"the fallback compression needs the docx-preflate helper; build it with "
+                f"the fallback compression needs the zippy-preflate helper; build it with "
                 f"'{BUILD_HINT}' or point ${ENV_VAR} at it")
         try:
             out = subprocess.run([exe, "version"], capture_output=True, check=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as e:
-            raise PreflateUnavailable(f"docx-preflate helper {exe} does not run: {e}") from e
+            raise PreflateUnavailable(f"zippy-preflate helper {exe} does not run: {e}") from e
         _version = out.stdout.decode("ascii", "replace").strip()
     return _version
 
@@ -91,7 +91,7 @@ def _run(cmd: str, frames: Sequence[bytes]) -> List[Tuple[bool, bytes]]:
     payload = b"".join(struct.pack("<I", len(f)) + bytes(f) for f in frames)
     proc = subprocess.run([helper_path(), cmd], input=payload, capture_output=True)
     if proc.returncode != 0:
-        raise RuntimeError(f"docx-preflate {cmd} failed ({proc.returncode}): "
+        raise RuntimeError(f"zippy-preflate {cmd} failed ({proc.returncode}): "
                            f"{proc.stderr.decode('utf-8', 'replace').strip()}")
     out, p, replies = proc.stdout, 0, []
     while p < len(out):
@@ -111,7 +111,7 @@ def split(streams: Sequence[bytes]) -> List[Tuple[Optional[bytes], str]]:
         return []
     replies = _run("split", streams)
     if len(replies) != len(streams):
-        raise RuntimeError(f"docx-preflate split answered {len(replies)} of {len(streams)} streams")
+        raise RuntimeError(f"zippy-preflate split answered {len(replies)} of {len(streams)} streams")
     return [(body, "") if ok else (None, body.decode("utf-8", "replace")) for ok, body in replies]
 
 
@@ -122,7 +122,7 @@ def recreate(pairs: Sequence[Tuple[bytes, bytes]]) -> List[bytes]:
     frames = [f for plain, corr in pairs for f in (plain, corr)]
     replies = _run("recreate", frames)
     if len(replies) != len(pairs):
-        raise RuntimeError(f"docx-preflate recreate answered {len(replies)} of {len(pairs)} parts")
+        raise RuntimeError(f"zippy-preflate recreate answered {len(replies)} of {len(pairs)} parts")
     out = []
     for ok, body in replies:
         if not ok:

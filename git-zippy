@@ -1,0 +1,8 @@
+#!/bin/sh
+# git-zippy launcher. Put it on your PATH (a symlink is fine) and git runs it
+# for `git zippy <command>`. It uses the Python that `git zippy install`
+# recorded (zippy.python), so a virtualenv need not be active.
+here="$(dirname "$(readlink -f "$0")")"
+py="$(git config --get zippy.python 2>/dev/null)"
+[ -n "$py" ] || py=python3
+exec "$py" "$here/zippy_cli.py" "$@"

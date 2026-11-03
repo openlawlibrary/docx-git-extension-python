@@ -81,13 +81,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
-name = "docx-preflate"
-version = "0.1.0"
-dependencies = [
- "preflate-rs",
-]
-
-[[package]]
 name = "glam"
 version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,3 +184,10 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "zippy-preflate"
+version = "0.1.0"
+dependencies = [
+ "preflate-rs",
+]

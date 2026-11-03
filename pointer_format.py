@@ -8,7 +8,7 @@ a new version as a small delta against the old one.
 
 EXAMPLE
 
-    DOCX-POINTER placeholder - this repository stores documents unpacked; ...
+    ZIPPY-POINTER placeholder - this repository stores documents unpacked; ...
     VERSION 1.0
     TREE 4b825dc642cb6eb9a060e54bf8d69288fbee4904
     HASH 0608f403f1af4053b2769afb4f244948fef547dcf5c96221a01820412d797c91
@@ -31,7 +31,7 @@ EXAMPLE
 
 LINES
 
-    DOCX-POINTER <notice>   Always the first line: identifies the file, and tells
+    ZIPPY-POINTER <notice>   Always the first line: identifies the file, and tells
                             whoever opens it in a clone without the extension
                             what to do. The post-commit hook and the clean
                             filter recognise pointers by this prefix.
@@ -101,8 +101,7 @@ VERSIONING
         only mean corruption;
       * anything that changes how the document is rebuilt is a new major, and
         a reader refuses a major it does not know, asking for an update.
-    Pointers without a VERSION line are from the pre-1.0 beta and are refused;
-    re-adding the document (git add --renormalize) rewrites them.
+    A pointer without a VERSION line is refused.
 """
 
 from __future__ import annotations
@@ -112,10 +111,10 @@ import binascii
 import re
 from typing import Dict, List, Optional, Tuple
 
-POINTER_MAGIC = "DOCX-POINTER"
-POINTER_NOTICE = ("placeholder - this repository stores documents unpacked; "
-                  "run the docx extension's install step here, then "
-                  "'git checkout -- .' to get the real file")
+POINTER_MAGIC = "ZIPPY-POINTER"
+POINTER_NOTICE = ("placeholder - this repository stores documents unpacked with "
+                  "git-zippy; run 'git zippy install', then 'git checkout -- .' "
+                  "to get the real file")
 
 VERSION = (1, 0)                 # what this code writes and the newest it fully understands
 FALLBACK_PROFILE = "fallback"    # PROFILE value when no known profile reproduces the document
@@ -395,10 +394,9 @@ def parse(text: str) -> Pointer:
     if lines and lines[-1] == "":
         lines.pop()
     if not lines or not lines[0].startswith(POINTER_MAGIC):
-        raise PointerError("not a docx pointer")
+        raise PointerError("not a zippy pointer")
     if len(lines) < 2 or not lines[1].startswith("VERSION "):
-        raise PointerError("pointer has no VERSION line: it was written by a pre-1.0 beta "
-                           "of the extension; re-add the document (git add --renormalize)")
+        raise PointerError("pointer has no VERSION line")
     version = parse_version(lines[1][len("VERSION "):])
     check_version(version)
     newer_minor = version[1] > VERSION[1]
