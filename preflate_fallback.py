@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-preflate_fallback.py - the fallback compression, for documents no profile reproduces.
+preflate_fallback.py - the fallback compression, for parts no profile reproduces.
 
 Known profiles (compression_profiles.py) rebuild a deflate stream from the
-plain part alone. When none of them reproduces a document - SharePoint and Word
-for the web output, Info-ZIP, anything new - clean asks preflate-rs instead:
+plain part alone. For a part none of them reproduces - an unknown producer,
+Info-ZIP's images, anything new - clean asks preflate-rs instead:
 it models how each stream was compressed and records the difference from its
 prediction, the "corrections" (typically 40-80 bytes per part). From the plain
 part plus those corrections it rebuilds the original stream byte for byte.

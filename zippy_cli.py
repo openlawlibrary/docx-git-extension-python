@@ -63,10 +63,12 @@ def install(args) -> int:
     if local and not repo:
         print("git zippy install --local: not inside a git repository", file=sys.stderr)
         return 1
-    check = subprocess.run([python, "-c", "import pygit2"], capture_output=True)
-    if check.returncode != 0:
-        print(f"{python} cannot import pygit2; install it there or pass --python", file=sys.stderr)
-        return 1
+    for module, package in (("pygit2", "pygit2"), ("zlib_ng", "zlib-ng")):
+        check = subprocess.run([python, "-c", f"import {module}"], capture_output=True)
+        if check.returncode != 0:
+            print(f"{python} cannot import {module}; pip install {package} there, or pass --python",
+                  file=sys.stderr)
+            return 1
     scope = "--local" if local else "--global"
     for key, value in (("filter.zippy.clean", _filter_cmd(python, "clean_filter.py")),
                        ("filter.zippy.smudge", _filter_cmd(python, "smudge_filter.py")),
@@ -117,6 +119,11 @@ def env(_args) -> int:
         print(f"pygit2      {pygit2.__version__} (libgit2 {pygit2.LIBGIT2_VERSION})")
     except ImportError:
         print("pygit2      MISSING")
+    try:
+        from zlib_ng import zlib_ng
+        print(f"zlib-ng     {zlib_ng.ZLIBNG_VERSION}")
+    except ImportError:
+        print("zlib-ng     MISSING (pip install zlib-ng): Word for the web parts would go to the fallback")
     try:
         print(f"fallback    {preflate_fallback.version()} at {preflate_fallback.helper_path()}")
     except preflate_fallback.PreflateUnavailable as e:

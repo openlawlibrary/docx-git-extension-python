@@ -22,13 +22,19 @@ EXAMPLE
 
     ARCHIVE comment=6d61646520627920736f6d6520746f6f6c
 
-    A document no profile reproduces uses the fallback instead:
+    A document whose parts come from several producers names the most used
+    profile on the PROFILE line and the others per entry; parts no profile
+    reproduces use the fallback (preflate) or, failing that, are kept raw:
 
-    PROFILE fallback
+    PROFILE aspose-ml#8
     FALLBACK preflate-rs/0.7.6
     DEFAULTS ...
-    ENTRY word/document.xml time=12106 date=23898 preflate=AAAEDAAEIAE+AP8DAQQAAAQQBAQDAA4AIDDw9zrPvwsT0D2gHJ4=
+    ENTRY word/document.xml breaks=27118,40102
+    ENTRY customXml/item1.xml flags=6 profile=sharepoint-fast
+    ENTRY docProps/app.xml preflate=AAAEDAAEIAE+AP8DAQQAAAQQBAQDAA4AIDDw9zrPvwsT0D2gHJ4=
     ENTRY word/odd.xml raw=1
+
+    When no profile reproduces any part, PROFILE is `fallback`.
 
     A document whose zip structure the lines below cannot describe is stored
     whole; its pointer has no DEFAULTS or ENTRY lines:
@@ -46,16 +52,17 @@ LINES
                             resolves this oid directly, never a ref.
     HASH <sha256>           Of the original document. Checkout refuses any
                             rebuild that does not match it.
-    PROFILE <name>          The compression profile that reproduces the
-                            document (compression_profiles.py); `fallback` when
-                            none does (entries rebuilt from preflate data or
+    PROFILE <name>          The compression profile of the entries that name
+                            none (compression_profiles.py): the one most
+                            entries use; `fallback` when no profile reproduces
+                            any entry (entries rebuilt from preflate data or
                             stored raw); `original` when the zip itself cannot
                             be described (zip64, gaps, encryption, other
                             compression methods, damaged...) and the document is
                             stored whole at .zippy/original in the parts tree.
                             Always present: smudge never guesses.
-    FALLBACK <tool>/<ver>   Only with PROFILE fallback: what made the entries'
-                            `preflate=` corrections (preflate_fallback.py). Their
+    FALLBACK <tool>/<ver>   When entries carry `preflate=`: what made those
+                            corrections (preflate_fallback.py). Their
                             format changes between preflate-rs releases, so
                             smudge rebuilds only with exactly this version.
     ARCHIVE <k=v ...>       Only when the zip itself has something to record:
@@ -85,6 +92,9 @@ ENTRY FIELDS (all decimal unless noted)
     comment  entry comment       } field stays short. Empty = none.
     flush    Word: uncompressed offsets of the full flushes inside the part
     breaks   other packagers: offsets of the blocks they cut early (Z_BLOCK)
+    profile  the compression profile of this entry, when it is not the one on
+             the PROFILE line (SharePoint keeps the parts it does not touch
+             and compresses the ones it writes differently).
     preflate fallback: base64 of the preflate-rs corrections that rebuild this
              deflated part from its plain bytes.
     raw      raw=1: neither a profile nor preflate reproduces this part (or the
@@ -92,7 +102,8 @@ ENTRY FIELDS (all decimal unless noted)
              .zippy/raw/<entry name> in the parts tree and copied back as they
              are. The plain part stays in the tree too, for diffs.
 
-    An entry has at most one of flush, breaks, preflate and raw.
+    An entry has at most one of flush, breaks, preflate and raw, and profile
+    only goes with flush or breaks.
 
     flush and breaks are GAPS: the first number is the offset from the start
     of the part, every next one the distance from the previous. An edit in the
@@ -293,6 +304,8 @@ FIELD_KEYS = [k for k, _, _ in FIELDS]
 BREAK_KEYS = {"flush": BREAK_FULL, "breaks": BREAK_BLOCK}
 PREFLATE_KEY = "preflate"
 RAW_KEY = "raw"
+PROFILE_KEY = "profile"
+_PROFILE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9#.+-]*")
 _FALLBACK_RE = re.compile(r"[a-z0-9][a-z0-9.+-]*/[0-9A-Za-z][0-9A-Za-z.+-]*")
 
 
@@ -320,7 +333,8 @@ def _field_values(e: Dict) -> Dict[str, str]:
 
 
 def _entry_from_values(name_raw: bytes, vals: Dict[str, str], kind: int, offs,
-                       preflate: Optional[bytes] = None, raw: bool = False) -> Dict:
+                       preflate: Optional[bytes] = None, raw: bool = False,
+                       profile: Optional[str] = None) -> Dict:
     p = {key: dec(vals[key]) for key, _, (_, dec) in FIELDS}
     flags = p["flags"]
     try:
@@ -339,7 +353,7 @@ def _entry_from_values(name_raw: bytes, vals: Dict[str, str], kind: int, offs,
                "extra_cd": p["cextra"], "comment": p["comment"]},
         "policy": {"use_data_descriptor": p["dd"] > 0, "dd_has_signature": p["dd"] == 2,
                    "flush_offsets": tuple(offs), "break_kind": kind if offs else BREAK_NONE,
-                   "preflate": preflate, "raw": raw},
+                   "preflate": preflate, "raw": raw, "profile": profile},
     }
 
 
@@ -368,7 +382,7 @@ def write(tree_oid: str, doc_hash: str, profile: str, entries: List[Dict],
     version that made the entries' preflate corrections (FALLBACK line).
     `archive_comment` is the zip's own comment (ARCHIVE line, only when set).
     """
-    if fallback is not None and (profile != FALLBACK_PROFILE or not _FALLBACK_RE.fullmatch(fallback)):
+    if fallback is not None and (profile == ORIGINAL_PROFILE or not _FALLBACK_RE.fullmatch(fallback)):
         raise PointerError(f"bad FALLBACK {fallback!r} for PROFILE {profile!r}")
     if profile == ORIGINAL_PROFILE:
         return "\n".join([f"{POINTER_MAGIC} {POINTER_NOTICE}", f"VERSION {format_version()}",
@@ -388,6 +402,13 @@ def write(tree_oid: str, doc_hash: str, profile: str, entries: List[Dict],
         parts = [encode_name(e["name_raw"])]
         parts += [f"{k}={r[k]}" for k in FIELD_KEYS if r[k] != defaults[k]]
         pol = e["policy"]
+        if pol.get("profile"):
+            own = pol["profile"]
+            if (own == profile or own in (FALLBACK_PROFILE, ORIGINAL_PROFILE)
+                    or not _PROFILE_NAME_RE.fullmatch(own)
+                    or pol.get("preflate") is not None or pol.get("raw")):
+                raise PointerError(f"bad profile {own!r} for entry {e['name']!r}")
+            parts.append(f"{PROFILE_KEY}={own}")
         if pol["flush_offsets"]:
             key = "flush" if pol["break_kind"] == BREAK_FULL else "breaks"
             parts.append(f"{key}={encode_gaps(pol['flush_offsets'])}")
@@ -471,7 +492,7 @@ def parse(text: str) -> Pointer:
             if defaults is None:
                 raise PointerError(f"line {n}: ENTRY before DEFAULTS")
             name, *items = rest.split(" ")
-            vals, kind, offs, seen, pre, raw = dict(defaults), BREAK_NONE, (), set(), None, False
+            vals, kind, offs, seen, pre, raw, prof = dict(defaults), BREAK_NONE, (), set(), None, False, None
             for kv in items:
                 k, eq, v = kv.partition("=")
                 if not eq or k in seen:
@@ -489,11 +510,18 @@ def parse(text: str) -> Pointer:
                     if v != "1":
                         raise PointerError(f"line {n}: bad raw value {v!r}")
                     raw = True
+                elif k == PROFILE_KEY:
+                    if (not _PROFILE_NAME_RE.fullmatch(v) or v in (FALLBACK_PROFILE, ORIGINAL_PROFILE)
+                            or v == head.get("PROFILE")):
+                        raise PointerError(f"line {n}: bad profile {v!r}")
+                    prof = v
                 else:
                     unknown(f"ENTRY key {k!r}")
             if sum((pre is not None, bool(offs), raw)) > 1:
                 raise PointerError(f"line {n}: more than one of flush/breaks, preflate, raw")
-            entries.append(_entry_from_values(decode_name(name), vals, kind, offs, pre, raw))
+            if prof is not None and (pre is not None or raw):
+                raise PointerError(f"line {n}: profile with preflate or raw")
+            entries.append(_entry_from_values(decode_name(name), vals, kind, offs, pre, raw, prof))
         else:
             unknown(f"line {key!r}")
     for key in ("TREE", "HASH", "PROFILE"):
@@ -509,9 +537,11 @@ def parse(text: str) -> Pointer:
         return Pointer(version, head["TREE"], head["HASH"], head["PROFILE"], [], None, None)
     if not entries:
         raise PointerError("pointer has no entries")
+    if any(e["policy"]["profile"] == head["PROFILE"] for e in entries):
+        raise PointerError("an entry repeats the PROFILE line's profile")
     fallback = head.get("FALLBACK")
     if fallback is not None:
-        if head["PROFILE"] != FALLBACK_PROFILE or not _FALLBACK_RE.fullmatch(fallback):
+        if not _FALLBACK_RE.fullmatch(fallback):
             raise PointerError(f"bad FALLBACK {fallback!r} for PROFILE {head['PROFILE']!r}")
     elif any(e["policy"]["preflate"] is not None for e in entries):
         raise PointerError("preflate corrections without a FALLBACK line")

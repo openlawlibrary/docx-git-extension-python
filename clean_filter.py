@@ -230,12 +230,56 @@ def _collect_entries(buf: bytes, cd_off: int, cd_size: int) -> List[Dict]:
     return items
 
 
+def stream_shape(comp: bytes, empty: bool, flushes) -> str:
+    """'plain' (no empty block), 'tail' (one, at the very end) or 'flushes'."""
+    if not empty:
+        return 'plain'
+    if not flushes and comp.endswith(compression_profiles.SYNC_TAIL):
+        return 'tail'
+    return 'flushes'
+
+
+def _fit_entry(raw: bytes, comp: bytes, usize: int, flushes, profile, can_scan: bool,
+               allow_fit: bool = True):
+    """(break kind, offsets) with which `profile` reproduces `comp`, or None."""
+    if profile['kind'] == 'msword':
+        kind = compression_profiles.BREAK_FULL if flushes else compression_profiles.BREAK_NONE
+        if compression_profiles.entry_matches(raw, comp, profile, kind, flushes):
+            return kind, tuple(flushes)
+        return None
+    if compression_profiles.entry_matches(raw, comp, profile):
+        return compression_profiles.BREAK_NONE, ()
+    if not (allow_fit and compression_profiles.fittable(profile)
+            and can_scan and block_breaks.supports_z_block()):
+        return None
+    offs = block_breaks.fit_breaks(raw, comp, usize, profile['level'],
+                                   profile['memlevel'], profile.get('strategy', 0))
+    return None if offs is None else (compression_profiles.BREAK_BLOCK, tuple(offs))
+
+
+# Per-entry search (mixed documents): how many block-break fits to attempt for
+# an entry no profile reproduces as it is. Fitting is the expensive step.
+FIT_ATTEMPTS = 3
+
+
 def _choose_profile(items: List[Dict]):
     """
-    Pick the one profile that reproduces every deflated entry, and the
-    per-entry breaks it needs. Returns (profile_name, breaks), or (None, no
-    breaks) when no profile does - the pointer then records `PROFILE fallback`,
-    and smudge uses the fallback compression.
+    Pick, for every deflated entry, the profile that reproduces it and the
+    breaks it needs. Returns (default profile name or None, {item index:
+    (profile name, break kind, offsets)}). Entries missing from the dict are
+    reproduced by no profile: the fallback (preflate) takes them, or raw.
+
+    The default is what the pointer's PROFILE line names; entries with another
+    profile carry profile= on their ENTRY line.
+
+    1. One profile for the whole document, as producers normally use one:
+       candidates as before (msword when every part ends in or contains a
+       flush, the plain profiles ranked by how much of the largest entry each
+       reproduces); the first that reproduces every entry wins.
+    2. Otherwise, per entry, largest first: the profiles already used in this
+       document first, then every profile the stream's shape allows; exact
+       matches first, then up to FIT_ATTEMPTS block-break fits. The default is
+       the profile most entries use, ties going to the one used first.
 
     Early exit everywhere a wrong answer can be recognised:
       * every comparison against the original streams the compressor's output
@@ -243,19 +287,17 @@ def _choose_profile(items: List[Dict]):
       * a candidate is dropped at the first entry it cannot reproduce, and the
         largest entry is tried first because it tells candidates apart best;
       * empty blocks are read with libz in one pass per entry: Word's flush
-        offsets come from that pass, and any empty block rules out the plain
-        zlib profiles without compressing anything;
+        offsets come from that pass, and the stream's shape rules profiles out
+        without compressing anything;
       * the break fitter resumes from its last confirmed break and stops each
         round at the first difference.
     """
-    none = [(compression_profiles.BREAK_NONE, ())] * len(items)
     deflated = [i for i, it in enumerate(items)
                 if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
     if not deflated:
         # Nothing is compressed, so every profile rebuilds it; record the first.
-        return compression_profiles.PROFILES[0]['name'], none
+        return compression_profiles.PROFILES[0]['name'], {}
     deflated.sort(key=lambda i: -len(items[i]['comp']))     # probe = largest
-    probe = deflated[0]
 
     raws: Dict[int, bytes] = {}
     for i in deflated:
@@ -263,72 +305,102 @@ def _choose_profile(items: List[Dict]):
             raws[i] = zlib.decompress(items[i]['comp'], -15)
         except Exception as e:
             logging.warning(f"cannot inflate {items[i]['name']}: {e}")
-            return None, none
+    deflated = [i for i in deflated if i in raws]
+    if not deflated:
+        return None, {}
+    probe = deflated[0]
 
     can_scan = block_breaks.is_available()
-    empty: Dict[int, bool] = {}
     flushes: Dict[int, Tuple[int, ...]] = {}
+    shape: Dict[int, str] = {}
     for i in deflated:
+        empty, flushes[i] = False, ()
         if can_scan:
             try:
-                empty[i], flushes[i] = block_breaks.empty_blocks(items[i]['comp'], items[i]['usize'])
-                continue
+                empty, flushes[i] = block_breaks.empty_blocks(items[i]['comp'], items[i]['usize'])
             except Exception as e:
                 logging.warning(f"block scan failed for {items[i]['name']}: {e}")
-        empty[i], flushes[i] = False, ()
+        shape[i] = stream_shape(items[i]['comp'], empty, flushes[i])
 
+    usable = [p for p in compression_profiles.PROFILES if compression_profiles.is_available(p)]
+
+    def ranked(profiles, i):
+        """`profiles` by how much of entry i each reproduces before it first differs."""
+        scored = []
+        for n, p in enumerate(profiles):
+            got = block_breaks.matching_prefix(
+                compression_profiles.iter_compress_entry(raws[i], p), items[i]['comp'])
+            scored.append((-got, n, p))
+        return [p for _, _, p in sorted(scored, key=lambda t: t[:2])]
+
+    # 1. one profile for every entry
+    shapes = {shape[i] for i in deflated}
     candidates = []
-    # Word ends every part with a flush, so it is only a candidate when every
-    # deflated entry has an empty block - and then it is the likely one.
-    if all(empty[i] for i in deflated) and msword_compressor.is_available():
-        candidates.append(compression_profiles.BY_NAME['msword'])
-    # A plain zlib profile never writes an empty block: any entry that has one
-    # rules all of them out. Otherwise try them in order of how much of the
-    # largest entry each reproduces before it first differs (an early-exit
-    # comparison, typically a block or two of work per candidate).
-    if not any(empty[i] for i in deflated):
-        ranked = []
-        for p in compression_profiles.ZLIB_PROFILES:
-            n = block_breaks.matching_prefix(
-                compression_profiles.iter_compress_entry(raws[probe], p), items[probe]['comp'])
-            ranked.append((-n, len(ranked), p))
-        candidates += [p for _, _, p in sorted(ranked, key=lambda t: t[:2])]
-
+    if 'plain' not in shapes:
+        # Word ends every part with a flush: msword first, then the producers
+        # that end with a sync flush (only when nothing has flushes inside).
+        candidates += [p for p in usable if p['kind'] == 'msword']
+        if shapes == {'tail'}:
+            candidates += ranked([p for p in usable if p['kind'] != 'msword'
+                                  and compression_profiles.accepts(p, 'tail')], probe)
+    elif shapes == {'plain'}:
+        candidates += ranked([p for p in usable if compression_profiles.accepts(p, 'plain')], probe)
     for profile in candidates:
-        breaks = _fit_profile(items, deflated, raws, flushes, profile, can_scan)
-        if breaks is not None:
+        assign = {}
+        for i in deflated:
+            fit = _fit_entry(raws[i], items[i]['comp'], items[i]['usize'], flushes[i],
+                             profile, can_scan)
+            if fit is None:
+                break
+            assign[i] = (profile['name'],) + fit
+        else:
             logging.info(f"Profile {profile['name']} reproduces every deflated entry")
-            return profile['name'], breaks
+            return profile['name'], assign
         logging.debug(f"Profile {profile['name']} rejected")
-    logging.warning("No profile reproduces this document; the pointer records "
-                    "PROFILE fallback and checkout will use the fallback compression")
-    return None, none
 
-
-def _fit_profile(items, deflated, raws, flushes, profile, can_scan):
-    """Per-entry breaks for `profile`, or None at the first entry it can't reproduce."""
-    breaks = [(compression_profiles.BREAK_NONE, ())] * len(items)
-    for i in deflated:                       # largest first: wrong candidates fail fast
-        raw, comp = raws[i], items[i]['comp']
-        if profile['kind'] == 'msword':
-            kind = compression_profiles.BREAK_FULL if flushes[i] else compression_profiles.BREAK_NONE
-            if not compression_profiles.entry_matches(raw, comp, profile, kind, flushes[i]):
-                return None
-            breaks[i] = (kind, flushes[i])
+    # 2. per entry
+    used: List[Dict] = []
+    assign = {}
+    for i in deflated:
+        allowed = [p for p in usable if compression_profiles.accepts(p, shape[i])]
+        order = [p for p in used if p in allowed] + [p for p in allowed if p not in used]
+        hit = None
+        for p in order:
+            fit = _fit_entry(raws[i], items[i]['comp'], items[i]['usize'], flushes[i],
+                             p, can_scan, allow_fit=False)
+            if fit is not None:
+                hit = (p, fit)
+                break
+        if hit is None and can_scan:
+            fits = [p for p in used if p in allowed and compression_profiles.fittable(p)]
+            fits += [p for p in ranked([p for p in allowed if compression_profiles.fittable(p)], i)
+                     if p not in fits]
+            for p in fits[:FIT_ATTEMPTS]:
+                fit = _fit_entry(raws[i], items[i]['comp'], items[i]['usize'], flushes[i],
+                                 p, can_scan)
+                if fit is not None:
+                    hit = (p, fit)
+                    break
+        if hit is None:
+            logging.info(f"No profile reproduces {items[i]['name']}")
             continue
-        if compression_profiles.entry_matches(raw, comp, profile):
-            continue
-        if not (can_scan and block_breaks.supports_z_block()):
-            return None
-        offs = block_breaks.fit_breaks(raw, comp, items[i]['usize'], profile['level'],
-                                       profile['memlevel'], profile.get('strategy', 0))
-        if offs is None:
-            return None
-        breaks[i] = (compression_profiles.BREAK_BLOCK, tuple(offs))
-    return breaks
+        p, fit = hit
+        if p not in used:
+            used.append(p)
+        assign[i] = (p['name'],) + fit
+    if not assign:
+        logging.warning("No profile reproduces any entry; the pointer records PROFILE fallback")
+        return None, {}
+    counts = {p['name']: 0 for p in used}
+    for name, _, _ in assign.values():
+        counts[name] += 1
+    default = max(counts, key=lambda n: counts[n])        # first used wins a tie
+    logging.info("Profiles per entry: " + ", ".join(f"{n} x{c}" for n, c in counts.items())
+                 + f"; {len(deflated) - len(assign)} for the fallback")
+    return default, assign
 
 
-def _preflate_corrections(items: List[Dict]):
+def _preflate_corrections(items: List[Dict], only=None):
     """
     The fallback: preflate-rs corrections for every deflated entry, as
     (fallback tool/version or None, {item index: corrections}, {item index:
@@ -337,7 +409,8 @@ def _preflate_corrections(items: List[Dict]):
     cannot model them, or there is no helper here - are stored raw instead.
     """
     deflated = [i for i, it in enumerate(items)
-                if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']]
+                if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']
+                and (only is None or i in only)]
     if not deflated:
         return None, {}, {}
     try:
@@ -358,20 +431,26 @@ def _preflate_corrections(items: List[Dict]):
     return tool, corrections, failed
 
 
-def pointer_entries(items: List[Dict], breaks, corrections=None, raw=()) -> List[Dict]:
-    """The pointer's entry list: each entry with its breaks, fallback corrections or raw flag."""
+def pointer_entries(items: List[Dict], assign, profile: str, corrections=None, raw=()) -> List[Dict]:
+    """
+    The pointer's entry list: each entry with its profile (when not the
+    document's `profile`) and breaks, its fallback corrections, or its raw flag.
+    `assign` is _choose_profile's {item index: (profile name, kind, offsets)}.
+    """
     corrections = corrections or {}
     out = []
-    for i, (it, (kind, offs)) in enumerate(zip(items, breaks)):
+    for i, it in enumerate(items):
+        name, kind, offs = assign.get(i, (None, compression_profiles.BREAK_NONE, ()))
         e = dict(it['entry'])
         e['policy'] = dict(e['policy'], flush_offsets=tuple(offs),
                            break_kind=kind if offs else compression_profiles.BREAK_NONE,
-                           preflate=corrections.get(i), raw=i in raw)
+                           preflate=corrections.get(i), raw=i in raw,
+                           profile=name if name and name != profile else None)
         logging.debug(
             f"entry {it['name']!r}: method={it['method']} dir={it['is_dir']} "
             f"gpf=0x{it['gpf']:04x} comp={len(it['comp'])} uncomp={it['usize']} "
             f"dd={it['use_dd']}/{it['dd_has_sig']} extra_lfh={len(it['extra_lfh'])} "
-            f"extra_cd={len(it['extra_cd'])} "
+            f"extra_cd={len(it['extra_cd'])} profile={name or '-'} "
             f"breaks={compression_profiles.BREAK_NAMES[kind]}:{offs or '-'}")
         out.append(e)
     return out
@@ -431,19 +510,25 @@ def plan_document(buf: bytes, parts_dir: Path) -> Dict:
     if why:
         return original(why)
 
-    profile_name, breaks = _choose_profile(items)
+    profile_name, assign = _choose_profile(items)
     # A deflated entry with no compressed bytes at all is not a deflate stream
     # anything can reproduce; keep its (empty) bytes.
     raw = {i: "it has no deflate data" for i, it in enumerate(items)
            if it['method'] == METHOD_DEFLATE and not it['is_dir'] and not it['comp']}
+    # Every other deflated entry no profile reproduces goes to the fallback,
+    # and what the fallback cannot model is kept raw.
+    rest = {i for i, it in enumerate(items)
+            if it['method'] == METHOD_DEFLATE and not it['is_dir'] and it['comp']
+            and i not in assign}
     fallback, corrections = None, {}
+    if rest:
+        fallback, corrections, failed = _preflate_corrections(items, rest)
+        raw.update(failed)
     if profile_name:
         logging.info(f"Recording compression profile: {profile_name}")
     else:
         profile_name = pointer_format.FALLBACK_PROFILE
-        fallback, corrections, failed = _preflate_corrections(items)
-        raw.update(failed)
-    return {'mode': 'pointer', 'items': items, 'profile': profile_name, 'breaks': breaks,
+    return {'mode': 'pointer', 'items': items, 'profile': profile_name, 'assign': assign,
             'fallback': fallback if corrections else None, 'corrections': corrections,
             'raw': raw, 'comment': comment}
 
@@ -512,7 +597,8 @@ def store_document(repo, buf: bytes, doc_hash: str, lfs_extensions=frozenset(),
 
     if plan['mode'] == 'original':
         return tree_oid, pointer_format.write(tree_oid, doc_hash, pointer_format.ORIGINAL_PROFILE, [])
-    entries = pointer_entries(plan['items'], plan['breaks'], plan['corrections'], plan['raw'])
+    entries = pointer_entries(plan['items'], plan['assign'], plan['profile'],
+                              plan['corrections'], plan['raw'])
     logging.info(f"{len(entries)} entries, profile {plan['profile']}, "
                  f"{len(plan['corrections'])} with preflate data, {len(plan['raw'])} raw")
     return tree_oid, pointer_format.write(tree_oid, doc_hash, plan['profile'], entries,

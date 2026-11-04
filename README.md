@@ -21,7 +21,7 @@ Like git-lfs: install once per machine, and every repository sets itself up.
    ln -s <extension>/git-zippy ~/.local/bin/git-zippy
    cargo build --release --manifest-path <extension>/preflate-helper/Cargo.toml
    ```
-2. With the Python that has pygit2 (e.g. an activated venv):
+2. With the Python that has pygit2 and zlib-ng (`pip install pygit2 zlib-ng`, e.g. in a venv):
    ```
    git zippy install            # filter config in ~/.gitconfig; records that Python
    git zippy install --local    # or: only for the repository you are in
@@ -92,16 +92,31 @@ ENTRY word/media/image1.jpeg breaks=18525,18598,62256,132156,20333,81003
 **Versioning.** `VERSION <major>.<minor>` is always the second line. A minor increase only adds information an older reader can ignore without rebuilding different bytes; anything that changes how a document is rebuilt is a new major, and a reader refuses a major it does not know.
 
 ## Compression profiles
-Every pointer names the profile its document is rebuilt with (`PROFILE <name>`), so checkout rebuilds once and never searches. Clean picks the profile:
+Every pointer names the profile each part is rebuilt with, so checkout rebuilds once and never searches.
 
-- Word candidate (`msword`) when every deflated part ends with a flush; Word's mid-part flush offsets are read with libz.
-- Otherwise the zlib profiles (`python-docx`, `aspose-ml#1`..`#9`), tried in order of how much of the largest part each reproduces, with block breaks fitted where needed.
-- Every comparison streams the compressor's output and stops at the first block that differs; a candidate is dropped at the first part it cannot reproduce, largest part first. The break fitter resumes from its last confirmed break, so its cost grows with the part's size, not with size times breaks, and it has no limit on the number of breaks.
+| Profile | Compressor | Who writes it |
+|---|---|---|
+| `python-docx` | zlib 6, memLevel 8 | python-docx, Python's zipfile, LibreOffice, Java (Apache POI, docx4j), JSZip (docx on npm), pandoc |
+| `msword` | Word's tuned zlib, full flushes | desktop Word |
+| `aspose-ml#1`..`#9` | zlib 5, memLevel 1..9 | Aspose.Words |
+| `sharepoint` | zlib 6/9, sync flush before the end | SharePoint, for the package parts it rewrites (`[Content_Types].xml`, rels, `docProps/core.xml`) |
+| `sharepoint-fast` | zlib 1/9, sync flush before the end | SharePoint, for the parts it adds (`customXml/*`, `docProps/custom.xml`) |
+| `word-web` | zlib-ng 2.2, level 6 | Word for the web (.NET 9+), saving the document |
+| `word-web-fast` | zlib-ng 2.2, level 1 | Word for the web, for the parts it adds |
+| `infozip-9` | zlib 9/9 with block breaks | Info-ZIP `zip -9` (epub build scripts). Its default `-6` matches `python-docx` except on incompressible parts (images), which go to the fallback |
 
-`PROFILE fallback` means no profile reproduced the document (SharePoint and Word for the web, Info-ZIP, anything new). Those documents use the fallback below.
+Clean picks them:
+
+- First one profile for the whole document, as most producers use one: `msword` when every deflated part ends with or contains a flush (Word's mid-part flush offsets are read with libz); otherwise the plain profiles, tried in order of how much of the largest part each reproduces, with block breaks fitted where needed.
+- When no single profile reproduces every part - SharePoint keeps the bytes of the parts it does not touch and writes the ones it changes with its own settings - each part gets its own: the profiles already used in the document first, then every profile the stream's shape allows (a stream ending in a sync flush can only come from a few), exact matches before block-break fits. The pointer's `PROFILE` line names the profile most parts use; the others are on their `ENTRY` lines (`profile=`). Parts no profile reproduces go to the fallback below, part by part.
+- Every comparison streams the compressor's output and stops at the first block that differs, largest part first. The break fitter resumes from its last confirmed break, so its cost grows with the part's size, not with size times breaks, and it has no limit on the number of breaks.
+
+`PROFILE fallback` means no profile reproduced any part.
+
+Like the helper, zlib-ng must be on every machine that adds documents: without it, Word for the web parts go to the fallback, so the same document gets a different pointer (and `git status` shows it modified). `git zippy install` checks for it.
 
 ## Fallback compression (preflate)
-For a `PROFILE fallback` document, clean asks [preflate-rs](https://github.com/microsoft/preflate-rs) to model every deflated part. It records the difference from its prediction, typically 40-80 bytes per part, as `preflate=<base64>` on the part's `ENTRY` line, plus the version that made it:
+For every deflated part no profile reproduces (all of them in a `PROFILE fallback` document), clean asks [preflate-rs](https://github.com/microsoft/preflate-rs) to model it. It records the difference from its prediction, typically 40-80 bytes per part, as `preflate=<base64>` on the part's `ENTRY` line, plus the version that made it:
 
 ```
 PROFILE fallback
@@ -148,7 +163,7 @@ In a fresh clone, `git lfs fetch --all origin` after fetching the parts containe
 - Long-running filter (`filter.zippy.process = git-zippy filter-process`), in the Rust version: the repository and pack indexes are opened once per git command instead of once per document, and git's delayed checkout lets smudge rebuild documents in parallel. (In the Python version ~0.13 s of a small document's clean is interpreter and pygit2 start-up, about an hour per 30k documents.)
 - Cache of fitted breaks and preflate corrections keyed by the compressed part's SHA-256 and the profile, so unchanged parts and repeated images skip the work on re-add and renormalize.
 - Unpack and rebuild in memory: clean writes the document to a temp folder, unpacks it and inflates every part again for the profile check (0.83 s of a 17 MB document's clean); smudge extracts the tree to a temp folder and reads it back.
-- More known profiles where producers are common (.NET packaging, zlib-ng from Word for the web), so fewer documents need the fallback.
+- More known profiles as samples come in: Google Docs and Apple Pages exports, WPS/OnlyOffice, the Open XML SDK on .NET 8 and earlier for Windows (zlib-intel), Node's built-in zlib (Chromium's), Info-ZIP's default level for images (a port of its deflate).
 - `zippy-lfs` for PNG and EMF as well as JPG: the largest parts in the samples are a 6.7 MB EMF and a 3.2 MB PNG.
 - Unit and integration testing
 - Extending documentation

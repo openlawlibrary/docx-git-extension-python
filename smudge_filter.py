@@ -3,8 +3,9 @@
 Smudge filter: turn a pointer back into the original document.
 
 Reads the pointer (pointer_format.py), extracts the parts tree it names,
-recompresses every entry with the one profile the pointer records and refuses
-the result unless its SHA-256 matches the pointer's HASH.
+recompresses every entry with the profile the pointer records for it (the
+PROFILE line, or the entry's own profile=) and refuses the result unless its
+SHA-256 matches the pointer's HASH.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -65,8 +66,9 @@ def build_docx_bytes(input_dir: Path, entries: List[Dict], profile: Dict,
     """
     Build the archive in memory from the extracted parts and the pointer's
     entry list (zip_layout.write_archive lays it out). Each deflated entry is
-    compressed with `profile`, rebuilt from its preflate corrections (all of a
-    document's in one helper call), or - raw=1 - copied from .zippy/raw/.
+    compressed with its own profile= or else `profile`, rebuilt from its
+    preflate corrections (all of a document's in one helper call), or - raw=1 -
+    copied from .zippy/raw/.
     """
     rebuilt = _preflate_streams(input_dir, entries)
 
@@ -91,7 +93,8 @@ def build_docx_bytes(input_dir: Path, entries: List[Dict], profile: Dict,
         elif id(ent) in rebuilt:
             comp = rebuilt[id(ent)]
         else:
-            comp = _compress_raw_deflate(raw, profile, pol.get('flush_offsets', ()),
+            own = profile_for(pol['profile']) if pol.get('profile') else profile
+            comp = _compress_raw_deflate(raw, own, pol.get('flush_offsets', ()),
                                          pol.get('break_kind', compression_profiles.BREAK_NONE))
         return comp, crc32, len(raw)
 
@@ -141,10 +144,9 @@ def extract_tree(repo, tree, path: Path, _pending=None):
 
 def profile_for(profile_name):
     """
-    The one profile this pointer is rebuilt with - no search.
+    The profile a pointer's PROFILE line, or an entry's profile=, names - no search.
 
-    Every pointer names its profile; `fallback` means clean found none that
-    reproduces the document. A name this version does not know is an error,
+    `fallback` means clean found no profile for any entry. A name this version does not know is an error,
     not a reason to guess: the pointer was written by a newer extension.
     """
     if profile_name == pointer_format.ORIGINAL_PROFILE:
@@ -159,10 +161,10 @@ def profile_for(profile_name):
     if named is None:
         raise ValueError(f"pointer names compression profile {profile_name!r}, which this "
                          f"version of the extension does not know; update the extension")
-    if named['kind'] == 'msword' and not msword_compressor.is_available():
-        raise RuntimeError("pointer needs the msword profile, which needs a shared zlib "
-                           "with deflateTune (Windows: zlib1.dll); none was found")
-    logging.info(f"Pointer records profile {compression_profiles.describe(named)}")
+    why = compression_profiles.unavailable_reason(named)
+    if why:
+        raise RuntimeError(f"pointer needs the {profile_name} profile, but {why}")
+    logging.debug(f"Profile {compression_profiles.describe(named)}")
     return named
 
 
@@ -199,6 +201,8 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
     # Settle the profile first: an unknown or unavailable one fails here,
     # before any parts are extracted or images downloaded.
     profile_def = profile_for(ptr.profile)
+    for name in sorted({e['policy']['profile'] for e in ptr.entries if e['policy'].get('profile')}):
+        profile_for(name)                 # unknown or unavailable: fail now
     if ptr.fallback:
         # The corrections only mean something to the preflate-rs that made them.
         have = preflate_fallback.version()           # raises when the helper is missing
