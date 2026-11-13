@@ -53,12 +53,12 @@ import os
 import re
 import subprocess
 import sys
-from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pygit2
 
 import pointer_format
+from utils.utils import repo_from_cwd
 
 REF = "refs/zippy/parts"
 TRACKING = "refs/zippy-remotes/{remote}/parts"
@@ -72,10 +72,6 @@ RACE = re.compile(r"non-fast-forward|fetch first|stale info|cannot lock ref|fail
 
 def log(msg: str) -> None:
     sys.stderr.write(f"[zippy] {msg}\n")
-
-
-def repo_from_cwd() -> pygit2.Repository:
-    return pygit2.Repository(pygit2.discover_repository(str(Path.cwd())))
 
 
 def key_path(oid: str) -> str:

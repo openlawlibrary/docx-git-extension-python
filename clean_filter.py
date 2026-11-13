@@ -14,220 +14,130 @@ fact is how they drift apart.
 
 Notes:
 - ZIP64 is not built; we error if sizes exceed ZIP32. Typical DOCX is fine.
-- Entry names are kept as stored bytes; for filesystem lookup they are decoded
-  using GPF_UTF8 or CP437.
+- Entry names are kept as stored bytes; for paths in the parts tree they are
+  decoded using GPF_UTF8 or CP437.
+- Everything happens in memory: the document is unpacked into {name: bytes}
+  and the parts tree is written from that, without a scratch folder.
 """
 
 from __future__ import annotations
-import io
 from pathlib import Path
-import shutil
+import struct
 import sys
-from typing import Dict, Iterable, List, Tuple
-import tempfile
-import zipfile
+from typing import Dict, List, Optional, Tuple
 import pygit2
 import logging
 import zlib
 import block_breaks
 import compression_profiles
-import msword_compressor
 import lfs_parts
 import pointer_format
 import preflate_fallback
 import zippy_setup
 import zip_layout
-from utils.utils import (read_u16, read_u32, calculate_sha256, repo_from_cwd)
-
-# === ZIP constants ===
-SIG_LFH   = 0x04034B50
-SIG_CFH   = 0x02014B50
-SIG_EOCD  = 0x06054B50
-SIG_DD    = 0x08074B50
+from zip_layout import (SIG_LFH, SIG_CFH, SIG_EOCD, SIG_DD, METHOD_STORE, METHOD_DEFLATE)
+from utils.utils import (read_u16, read_u32, calculate_sha256, common_prefix, repo_from_cwd)
 
 GPF_ENCRYPTED       = 0x0001
 GPF_DATA_DESCRIPTOR = 0x0008
 GPF_UTF8            = 0x0800
 
-METHOD_STORE = 0
-METHOD_DEFLATE = 8
-# The pointer's first line. Defined in pointer_format, which smudge shares;
-# the post-commit hook repeats the prefix because it must stay self-contained.
-POINTER_MAGIC = pointer_format.POINTER_MAGIC
+# The same record layouts zip_layout.write_archive packs.
+_CFH = struct.Struct('<IHHHHHHIIIHHHHHII')     # central directory file header
+_LFH = struct.Struct('<IHHHHHIIIHH')           # local file header
 
 log_path = Path.cwd() / "zippy_clean.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 
-def _eocd_offset(buf: bytes) -> int:
-    """Offset of the EOCD (End Of Central Directory) record, found by scanning backwards."""
+def read_eocd(buf: bytes) -> Tuple[int, int, bytes]:
+    """(central directory offset, its size, the zip's own comment), from the
+    EOCD (End Of Central Directory) record, found by scanning backwards."""
     start = len(buf) - min(len(buf), 65557)
     for i in range(len(buf) - 22, start - 1, -1):
         if read_u32(buf, i) == SIG_EOCD and i + 22 + read_u16(buf, i + 20) <= len(buf):
-            return i
+            return read_u32(buf, i + 16), read_u32(buf, i + 12), buf[i + 22:i + 22 + read_u16(buf, i + 20)]
     raise ValueError('EOCD not found')
 
 
-def find_eocd(buf: bytes) -> Tuple[int, int]:
-    """Central Directory offset and size, from the EOCD record."""
-    i = _eocd_offset(buf)
-    return read_u32(buf, i + 16), read_u32(buf, i + 12)
-
-
-def archive_comment(buf: bytes) -> bytes:
-    """The zip's own comment, stored in the EOCD record (usually empty)."""
-    i = _eocd_offset(buf)
-    return buf[i + 22:i + 22 + read_u16(buf, i + 20)]
-
-
-def iterate_cd_entries(buf: bytes, cd_off: int, cd_size: int) -> Iterable[Dict]:
-    """
-    Iterate through Central Directory entries.
-    """
-    p = cd_off
-    end = cd_off + cd_size
-    while p < end:
-        if read_u32(buf, p) != SIG_CFH:
-            raise ValueError(f'Invalid CFH signature at 0x{p:X}')
-        version_made    = read_u16(buf, p+4)
-        version_needed  = read_u16(buf, p+6)
-        gpf             = read_u16(buf, p+8)
-        method          = read_u16(buf, p+10)
-        dos_time        = read_u16(buf, p+12)
-        dos_date        = read_u16(buf, p+14)
-        crc32           = read_u32(buf, p+16)
-        comp_size       = read_u32(buf, p+20)
-        uncomp_size     = read_u32(buf, p+24)
-        name_len        = read_u16(buf, p+28)
-        extra_len       = read_u16(buf, p+30)
-        comment_len     = read_u16(buf, p+32)
-        disk_start      = read_u16(buf, p+34)
-        internal_attr   = read_u16(buf, p+36)
-        external_attr   = read_u32(buf, p+38)
-        lfh_rel_off     = read_u32(buf, p+42)
-        p += 46
-        name = buf[p:p+name_len]
-        p += name_len
-        extra = buf[p:p+extra_len]
-        p += extra_len
-        comment = buf[p:p+comment_len]
-        p += comment_len
-        try:
-            name_str = name.decode('utf-8') if (gpf & GPF_UTF8) else name.decode('cp437')
-        except Exception:
-            name_str = name.decode('utf-8', 'replace')
-        yield {
-            'name': name_str,
-            'name_raw': name,
-            'gpf': gpf,
-            'method': method,
-            'dos_time': dos_time,
-            'dos_date': dos_date,
-            'crc32': crc32,
-            'comp_size': comp_size,
-            'uncomp_size': uncomp_size,
-            'version_made': version_made,
-            'version_needed': version_needed,
-            'disk_start': disk_start,
-            'internal_attr': internal_attr,
-            'external_attr': external_attr,
-            'lfh_rel_off': lfh_rel_off,
-            'extra_raw': extra,
-            'comment_raw': comment,
-        }
-
-
-def parse_lfh(buf: bytes, off: int) -> Dict:
-    """
-    Extract Local File Header bytes and parse them.
-    """
-    if read_u32(buf, off) != SIG_LFH:
-        raise ValueError(f'Invalid LFH signature at 0x{off:X}')
-    version_needed  = read_u16(buf, off+4)
-    gpf             = read_u16(buf, off+6)
-    method          = read_u16(buf, off+8)
-    dos_time        = read_u16(buf, off+10)
-    dos_date        = read_u16(buf, off+12)
-    crc32           = read_u32(buf, off+14)
-    comp_size       = read_u32(buf, off+18)
-    uncomp_size     = read_u32(buf, off+22)
-    name_len        = read_u16(buf, off+26)
-    extra_len       = read_u16(buf, off+28)
-    name = buf[off+30: off+30+name_len]
-    extra = buf[off+30+name_len: off+30+name_len+extra_len]
+def _decode_name(raw: bytes, gpf: int) -> str:
     try:
-        name_str = name.decode('utf-8') if (gpf & GPF_UTF8) else name.decode('cp437')
-    except Exception:
-        name_str = name.decode('utf-8', 'replace')
-    return {
-        'version_needed': version_needed,
-        'gpf': gpf,
-        'method': method,
-        'dos_time': dos_time,
-        'dos_date': dos_date,
-        'crc32': crc32,
-        'comp_size': comp_size,
-        'uncomp_size': uncomp_size,
-        'name_len': name_len,
-        'extra_len': extra_len,
-        'name_raw': name,
-        'name': name_str,
-        'extra_raw': extra,
-        'data_off': off + 30 + name_len + extra_len,
-        'lfh_off': off,
-    }
+        return raw.decode('utf-8') if (gpf & GPF_UTF8) else raw.decode('cp437')
+    except UnicodeDecodeError:
+        return raw.decode('utf-8', 'replace')
 
-def _collect_entries(buf: bytes, cd_off: int, cd_size: int) -> List[Dict]:
+
+def read_entries(buf: bytes, cd_off: int, cd_size: int) -> List[Dict]:
     """
-    Parse every entry once, keeping both the metadata record and the bytes a
-    codec search needs. Reading the archive twice would be wasteful on the large
-    documents where the search matters most.
+    One item per zip entry, in central directory order: `entry` is what the
+    pointer records (the structure pointer_format writes and smudge rebuilds
+    from), `comp` the entry's bytes as stored.
     """
     items: List[Dict] = []
-    for c in iterate_cd_entries(buf, cd_off, cd_size):
-        lfh = parse_lfh(buf, c['lfh_rel_off'])
-        # data descriptor policy detection
-        use_dd = 1 if (lfh['gpf'] & GPF_DATA_DESCRIPTOR) else 0
-        comp_len = c['comp_size'] if lfh['comp_size'] == 0 else lfh['comp_size']
-        dd_has_sig = 0
-        if use_dd:
-            data_end = lfh['data_off'] + comp_len
-            if data_end + 4 <= len(buf) and read_u32(buf, data_end) == SIG_DD:
-                dd_has_sig = 1
-        name = c['name_raw']
-        is_dir = name.endswith(b'/')
-        extra_lfh = lfh['extra_raw']
-        extra_cd  = c['extra_raw']
-        # What the pointer records for this entry, in the structure
-        # pointer_format writes and smudge rebuilds from.
+    p, end = cd_off, cd_off + cd_size
+    while p < end:
+        (sig, made, cd_ver, _gpf, _method, cd_time, cd_date, crc, csize, usize, nlen, xlen,
+         clen, _disk, iattr, eattr, lfh_off) = _CFH.unpack_from(buf, p)
+        if sig != SIG_CFH:
+            raise ValueError(f'Invalid CFH signature at 0x{p:X}')
+        p += _CFH.size
+        name_raw = buf[p:p + nlen]
+        extra_cd = buf[p + nlen:p + nlen + xlen]
+        comment = buf[p + nlen + xlen:p + nlen + xlen + clen]
+        p += nlen + xlen + clen
+
+        (lsig, ver, gpf, method, dtime, ddate, _lcrc, lcsize, _lusize, lnlen,
+         lxlen) = _LFH.unpack_from(buf, lfh_off)
+        if lsig != SIG_LFH:
+            raise ValueError(f'Invalid LFH signature at 0x{lfh_off:X}')
+        extra_lfh = buf[lfh_off + 30 + lnlen:lfh_off + 30 + lnlen + lxlen]
+        data_off = lfh_off + 30 + lnlen + lxlen
+        comp_len = csize if lcsize == 0 else lcsize
+        use_dd = bool(gpf & GPF_DATA_DESCRIPTOR)
+        dd_has_sig = (use_dd and data_off + comp_len + 4 <= len(buf)
+                      and read_u32(buf, data_off + comp_len) == SIG_DD)
+        name = _decode_name(name_raw, gpf)
+        is_dir = name_raw.endswith(b'/')
         entry = {
-            'name': c['name'],
-            'name_raw': name,
+            'name': name,
+            'name_raw': name_raw,
             'is_dir': is_dir,
-            'lfh': {'version_needed': lfh['version_needed'], 'flags': lfh['gpf'],
-                    'method': lfh['method'], 'dos_time': lfh['dos_time'],
-                    'dos_date': lfh['dos_date'], 'extra_lfh': extra_lfh},
-            'cd': {'version_made_by': c['version_made'], 'version_needed': c['version_needed'],
-                   'dos_time': c['dos_time'], 'dos_date': c['dos_date'],
-                   'internal_attr': c['internal_attr'], 'external_attr': c['external_attr'],
-                   'extra_cd': extra_cd, 'comment': c['comment_raw']},
-            'policy': {'use_data_descriptor': bool(use_dd), 'dd_has_signature': bool(dd_has_sig),
+            'lfh': {'version_needed': ver, 'flags': gpf, 'method': method,
+                    'dos_time': dtime, 'dos_date': ddate, 'extra_lfh': extra_lfh},
+            'cd': {'version_made_by': made, 'version_needed': cd_ver,
+                   'dos_time': cd_time, 'dos_date': cd_date,
+                   'internal_attr': iattr, 'external_attr': eattr,
+                   'extra_cd': extra_cd, 'comment': comment},
+            'policy': {'use_data_descriptor': use_dd, 'dd_has_signature': bool(dd_has_sig),
                        'flush_offsets': (), 'break_kind': compression_profiles.BREAK_NONE,
                        'preflate': None},
         }
-        items.append({
-            'name': c['name'],
-            'entry': entry,
-            'method': lfh['method'],
-            'is_dir': bool(is_dir),
-            'comp': buf[lfh['data_off']:lfh['data_off'] + comp_len],
-            'usize': c['uncomp_size'],
-            'gpf': lfh['gpf'],
-            'use_dd': use_dd,
-            'dd_has_sig': dd_has_sig,
-            'extra_lfh': extra_lfh,
-            'extra_cd': extra_cd,
-        })
+        items.append({'name': name, 'entry': entry, 'method': method, 'is_dir': is_dir,
+                      'comp': buf[data_off:data_off + comp_len], 'usize': usize, 'crc': crc})
     return items
+
+
+def unpack(items: List[Dict]) -> Dict[str, bytes]:
+    """
+    The plain bytes of every file entry, {name: bytes}; also kept on each item
+    as 'data'. Raises on what an unzip would refuse: an unknown method, a
+    damaged stream, a size or CRC that does not match.
+    """
+    parts: Dict[str, bytes] = {}
+    for it in items:
+        if it['is_dir']:
+            continue
+        comp, method = it['comp'], it['method']
+        if method == METHOD_STORE:
+            data = comp
+        elif method == METHOD_DEFLATE:
+            data = zlib.decompress(comp, -15) if comp else b''
+        else:
+            raise ValueError(f"entry {it['name']!r} uses compression method {method}")
+        if len(data) != it['usize'] or (zlib.crc32(data) & 0xFFFFFFFF) != it['crc']:
+            raise ValueError(f"entry {it['name']!r} is damaged (size or CRC-32 does not match)")
+        it['data'] = data
+        parts[it['name']] = data
+    return parts
 
 
 def stream_shape(comp: bytes, empty: bool, flushes) -> str:
@@ -273,9 +183,12 @@ def _choose_profile(items: List[Dict]):
     profile carry profile= on their ENTRY line.
 
     1. One profile for the whole document, as producers normally use one:
-       candidates as before (msword when every part ends in or contains a
-       flush, the plain profiles ranked by how much of the largest entry each
-       reproduces); the first that reproduces every entry wins.
+       msword when every part ends in or contains a flush, otherwise the
+       plain profiles ranked by how much of the largest entry each
+       reproduces; the first that reproduces every entry wins. Trying this
+       before going part by part keeps single-producer documents on one
+       profile even where a small part would match several, so the pointer is
+       the same whatever order the per-part search would take.
     2. Otherwise, per entry, largest first: the profiles already used in this
        document first, then every profile the stream's shape allows; exact
        matches first, then up to FIT_ATTEMPTS block-break fits. The default is
@@ -298,16 +211,7 @@ def _choose_profile(items: List[Dict]):
         # Nothing is compressed, so every profile rebuilds it; record the first.
         return compression_profiles.PROFILES[0]['name'], {}
     deflated.sort(key=lambda i: -len(items[i]['comp']))     # probe = largest
-
-    raws: Dict[int, bytes] = {}
-    for i in deflated:
-        try:
-            raws[i] = zlib.decompress(items[i]['comp'], -15)
-        except Exception as e:
-            logging.warning(f"cannot inflate {items[i]['name']}: {e}")
-    deflated = [i for i in deflated if i in raws]
-    if not deflated:
-        return None, {}
+    raws = {i: items[i]['data'] for i in deflated}
     probe = deflated[0]
 
     can_scan = block_breaks.is_available()
@@ -448,15 +352,13 @@ def pointer_entries(items: List[Dict], assign, profile: str, corrections=None, r
                            profile=name if name and name != profile else None)
         logging.debug(
             f"entry {it['name']!r}: method={it['method']} dir={it['is_dir']} "
-            f"gpf=0x{it['gpf']:04x} comp={len(it['comp'])} uncomp={it['usize']} "
-            f"dd={it['use_dd']}/{it['dd_has_sig']} extra_lfh={len(it['extra_lfh'])} "
-            f"extra_cd={len(it['extra_cd'])} profile={name or '-'} "
+            f"comp={len(it['comp'])} uncomp={it['usize']} profile={name or '-'} "
             f"breaks={compression_profiles.BREAK_NAMES[kind]}:{offs or '-'}")
         out.append(e)
     return out
 
 
-def _check_container(buf: bytes, items: List[Dict], parts_dir: Path, comment: bytes):
+def _check_container(buf: bytes, items: List[Dict], comment: bytes) -> Optional[str]:
     """
     None when smudge's zip writer, given the original compressed bytes, writes
     exactly `buf`; otherwise why not. No compression - one pass over the bytes.
@@ -467,48 +369,49 @@ def _check_container(buf: bytes, items: List[Dict], parts_dir: Path, comment: by
         it = by_id[id(entry)]
         if it['is_dir']:
             return zip_layout.dir_data(it['method']), 0, 0
-        data = (parts_dir / entry['name']).read_bytes()
-        return (data if it['method'] == METHOD_STORE else it['comp'],
-                zlib.crc32(data) & 0xFFFFFFFF, len(data))
+        return it['comp'], zlib.crc32(it['data']) & 0xFFFFFFFF, len(it['data'])
     try:
         rebuilt = zip_layout.write_archive([it['entry'] for it in items], part, comment)
     except Exception as e:
         return f"its zip layout cannot be written back ({e})"
     if rebuilt != buf:
-        off = zip_layout.first_difference(rebuilt, buf)
+        off = common_prefix(rebuilt, buf)
         return (f"its zip layout differs from what the pointer can describe "
                 f"(first difference at byte {off} of {len(buf)})")
     return None
 
 
-def plan_document(buf: bytes, parts_dir: Path) -> Dict:
+def plan_document(buf: bytes) -> Dict:
     """
-    Unpack `buf` into `parts_dir` and decide how the document is stored:
-    mode 'pointer' (profile or fallback, some entries possibly raw) or mode
-    'original' (stored whole), with the reason.
+    Unpack `buf` and decide how the document is stored: mode 'pointer'
+    (profile or fallback, some entries possibly raw) or mode 'original'
+    (stored whole), with the reason. 'parts' is what goes into the parts tree
+    besides git-zippy's own files ({path: bytes}), 'dirs' the directory
+    entries, which stay in the tree even when empty.
     """
-    def original(reason):
-        return {'mode': 'original', 'reason': reason}
+    def original(reason, parts=None, dirs=()):
+        # Parts that could be unpacked stay next to the whole document, for diffs.
+        return {'mode': 'original', 'reason': reason, 'parts': parts or {}, 'dirs': list(dirs)}
     try:
-        cd_off, cd_size = find_eocd(buf)
-        items = _collect_entries(buf, cd_off, cd_size)
-        with zipfile.ZipFile(io.BytesIO(buf)) as z:
-            z.extractall(parts_dir)
+        cd_off, cd_size, comment = read_eocd(buf)
+        items = read_entries(buf, cd_off, cd_size)
+        parts = unpack(items)
     except Exception as e:
         return original(f"it is not a zip this extension can read ({e})")
     if not items:
         return original("it has no zip entries")
     for it in items:
         if not zip_layout.safe_name(it['name']):
+            # Not usable as a path in the parts tree (or one of ours): the whole
+            # document alone.
             return original(f"entry name {it['name']!r} cannot be stored as a part")
-        if it['method'] not in (METHOD_STORE, METHOD_DEFLATE):
-            return original(f"entry {it['name']!r} uses compression method {it['method']}")
-        if it['gpf'] & GPF_ENCRYPTED:
-            return original(f"entry {it['name']!r} is encrypted")
-    comment = archive_comment(buf)
-    why = _check_container(buf, items, parts_dir, comment)
+    dirs = [it['name'].rstrip('/') for it in items if it['is_dir']]
+    for it in items:
+        if it['entry']['lfh']['flags'] & GPF_ENCRYPTED:
+            return original(f"entry {it['name']!r} is encrypted", parts, dirs)
+    why = _check_container(buf, items, comment)
     if why:
-        return original(why)
+        return original(why, parts, dirs)
 
     profile_name, assign = _choose_profile(items)
     # A deflated entry with no compressed bytes at all is not a deflate stream
@@ -530,32 +433,50 @@ def plan_document(buf: bytes, parts_dir: Path) -> Dict:
         profile_name = pointer_format.FALLBACK_PROFILE
     return {'mode': 'pointer', 'items': items, 'profile': profile_name, 'assign': assign,
             'fallback': fallback if corrections else None, 'corrections': corrections,
-            'raw': raw, 'comment': comment}
+            'raw': raw, 'comment': comment, 'parts': parts, 'dirs': dirs}
 
 
-def add_directory_to_tree(repo, base_path, tree_builder, lfs_extensions=frozenset(), rel=""):
+def write_tree(repo, files: Dict[str, bytes], dirs=(), lfs_extensions=frozenset()) -> str:
     """
-    Create a git tree from a directory.
+    Write a git tree from {path: bytes} (plus directories that must exist even
+    when empty) and return its oid.
 
     Parts whose extension is in `lfs_extensions` go to the local LFS store and
     the tree holds their LFS pointer instead; see lfs_parts.py. So does a whole
     document stored at .zippy/original when the document uses LFS at all.
     """
-    for entry in sorted(base_path.iterdir()):
-        path = f"{rel}{entry.name}"
-        if entry.is_file():
-            data = entry.read_bytes()
-            if path == zip_layout.ORIGINAL and lfs_extensions and data:
-                data = lfs_parts.store(repo, data)
+    root: Dict = {}
+
+    def node_for(components):
+        node = root
+        for c in components:
+            node = node.setdefault(c, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"{'/'.join(components)}: a part and a folder share a name")
+        return node
+
+    for d in dirs:
+        node_for(d.split("/"))
+    for path, data in files.items():
+        *folders, leaf = path.split("/")
+        node = node_for(folders)
+        if isinstance(node.get(leaf), dict):
+            raise ValueError(f"{path}: a part and a folder share a name")
+        if path == zip_layout.ORIGINAL and lfs_extensions and data:
+            node[leaf] = lfs_parts.store(repo, data)
+        else:
+            node[leaf] = lfs_parts.blob_for_part(repo, leaf, data, lfs_extensions)
+
+    def write(node) -> pygit2.Oid:
+        builder = repo.TreeBuilder()
+        for name, value in node.items():
+            if isinstance(value, dict):
+                builder.insert(name, write(value), pygit2.GIT_FILEMODE_TREE)
             else:
-                data = lfs_parts.blob_for_part(repo, entry.name, data, lfs_extensions)
-            blob_oid = repo.create_blob(data)
-            tree_builder.insert(entry.name, blob_oid, pygit2.GIT_FILEMODE_BLOB)
-        elif entry.is_dir():
-            sub_builder = repo.TreeBuilder()
-            add_directory_to_tree(repo, entry, sub_builder, lfs_extensions, path + "/")
-            subtree_oid = sub_builder.write()
-            tree_builder.insert(entry.name, subtree_oid, pygit2.GIT_FILEMODE_TREE)
+                builder.insert(name, repo.create_blob(value), pygit2.GIT_FILEMODE_BLOB)
+        return builder.write()
+
+    return str(write(root))
 
 
 def store_document(repo, buf: bytes, doc_hash: str, lfs_extensions=frozenset(),
@@ -564,36 +485,32 @@ def store_document(repo, buf: bytes, doc_hash: str, lfs_extensions=frozenset(),
     Store the document's parts as a git tree and return (tree oid, pointer).
     Built completely before anything reaches stdout.
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        parts_dir = Path(tmpdir) / "parts"
-        parts_dir.mkdir()
-        plan = plan_document(buf, parts_dir)
-        if plan['mode'] == 'original':
-            logging.warning(f"{display}: stored whole: {plan['reason']}")
-            sys.stderr.write(f"[zippy] {display}: stored whole, not unpacked for rebuilding, "
-                             f"because {plan['reason']}\n")
-            if (parts_dir / zip_layout.RESERVED).exists():
-                # The document has parts of its own under .zippy/: keep only the original.
-                shutil.rmtree(parts_dir)
-                parts_dir.mkdir()
-            target = parts_dir / zip_layout.ORIGINAL
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(buf)
-        else:
-            items = plan['items']
-            for i in plan['raw']:
-                target = parts_dir / zip_layout.RAW_DIR / items[i]['name']
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(items[i]['comp'])
-            if plan['raw']:
-                size = sum(len(items[i]['comp']) for i in plan['raw'])
-                reasons = sorted(set(plan['raw'].values()))
-                sys.stderr.write(f"[zippy] {display}: {len(plan['raw'])} part(s) stored as their "
-                                 f"original compressed bytes ({size:,} bytes): "
-                                 f"{'; '.join(reasons)}\n")
-        builder = repo.TreeBuilder()
-        add_directory_to_tree(repo, parts_dir, builder, lfs_extensions)
-        tree_oid = str(builder.write())
+    plan = plan_document(buf)
+    files = dict(plan['parts'])
+    if plan['mode'] == 'original':
+        logging.warning(f"{display}: stored whole: {plan['reason']}")
+        sys.stderr.write(f"[zippy] {display}: stored whole, not unpacked for rebuilding, "
+                         f"because {plan['reason']}\n")
+        files[zip_layout.ORIGINAL] = buf
+    else:
+        items = plan['items']
+        for i in plan['raw']:
+            files[f"{zip_layout.RAW_DIR}/{items[i]['name']}"] = items[i]['comp']
+        if plan['raw']:
+            size = sum(len(items[i]['comp']) for i in plan['raw'])
+            reasons = sorted(set(plan['raw'].values()))
+            sys.stderr.write(f"[zippy] {display}: {len(plan['raw'])} part(s) stored as their "
+                             f"original compressed bytes ({size:,} bytes): "
+                             f"{'; '.join(reasons)}\n")
+    try:
+        tree_oid = write_tree(repo, files, plan['dirs'], lfs_extensions)
+    except ValueError as e:
+        # A part and a folder with the same name: no tree can hold both.
+        plan = {'mode': 'original', 'reason': str(e)}
+        logging.warning(f"{display}: stored whole: {e}")
+        sys.stderr.write(f"[zippy] {display}: stored whole, not unpacked for rebuilding, "
+                         f"because {e}\n")
+        tree_oid = write_tree(repo, {zip_layout.ORIGINAL: buf}, (), lfs_extensions)
 
     if plan['mode'] == 'original':
         return tree_oid, pointer_format.write(tree_oid, doc_hash, pointer_format.ORIGINAL_PROFILE, [])
@@ -628,10 +545,10 @@ def main():
         sys.stderr.write(f"clean_filter.py: {docx_path} is empty, refusing to clean\n")
         sys.exit(1)
 
-    if docx_bytes[:len(POINTER_MAGIC)] == POINTER_MAGIC.encode():
+    if pointer_format.is_pointer(docx_bytes):
         # The worktree holds a pointer rather than a document, so a checkout
         # wrote the stored bytes straight to disk - the smudge filter was not
-        # configured, or it failed and filter.docx.required was not set.
+        # configured, or it failed and filter.zippy.required was not set.
         # Cleaning this would store a pointer to a pointer; the document is not
         # here to be stored. Say so, because the generic "not a zip file" sends
         # people to inspect a document that was never the problem.
@@ -648,7 +565,7 @@ def main():
     # fetch refspec (once; see zippy_setup.py).
     zippy_setup.ensure_repo(repo.workdir or Path.cwd())
     # Which parts go to LFS is a property of the document's path, set in
-    # .gitattributes (zippy-lfs=jpg,jpeg). Unset means none, as before.
+    # .gitattributes (zippy-lfs=jpg,jpeg,png,emf). Unset means none.
     lfs_extensions = lfs_parts.extensions_for(repo, str(docx_path).replace("\\", "/"))
     if lfs_extensions:
         logging.info(f"Parts with extensions {sorted(lfs_extensions)} go to LFS")

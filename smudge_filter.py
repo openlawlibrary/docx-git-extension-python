@@ -2,28 +2,26 @@
 """
 Smudge filter: turn a pointer back into the original document.
 
-Reads the pointer (pointer_format.py), extracts the parts tree it names,
-recompresses every entry with the profile the pointer records for it (the
-PROFILE line, or the entry's own profile=) and refuses the result unless its
-SHA-256 matches the pointer's HASH.
+Reads the pointer (pointer_format.py), reads the parts tree it names into
+memory, recompresses every entry with the profile the pointer records for it
+(the PROFILE line, or the entry's own profile=) and refuses the result unless
+its SHA-256 matches the pointer's HASH.
 """
 from __future__ import annotations
 from pathlib import Path
 import sys
 import zlib
-from typing import Dict, List, Tuple
-import tempfile
+from typing import Dict, List
 import pygit2
 import logging
 import compression_profiles
-import msword_compressor
 import lfs_parts
 import parts_container
 import pointer_format
 import preflate_fallback
 import zippy_setup
 import zip_layout
-from utils.utils import calculate_sha256
+from utils.utils import calculate_sha256, repo_from_cwd
 
 # Smudge only writes zips (zip_layout.py); reading them is the clean filter's job.
 METHOD_STORE = zip_layout.METHOD_STORE
@@ -32,131 +30,109 @@ METHOD_DEFLATE = zip_layout.METHOD_DEFLATE
 log_path = Path.cwd() / "zippy_smudge.log"
 logging.basicConfig(filename=log_path, level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
 
-def _compress_raw_deflate(data: bytes, profile: Dict, flush_offsets: tuple = (),
-                          break_kind: int = compression_profiles.BREAK_NONE) -> bytes:
-    """
-    Raw DEFLATE for one entry, per the given compression profile.
 
-    `flush_offsets` means different things depending on `break_kind`: a full
-    flush for Word's split parts, or a bare block break for packagers that cut
-    blocks with Z_BLOCK. A profile that cannot honour the kind it is handed
-    raises rather than quietly producing the wrong framing.
-    """
-    return compression_profiles.compress_entry(data, profile, break_kind, flush_offsets)
-
-def _preflate_streams(input_dir: Path, entries: List[Dict]) -> Dict[int, bytes]:
+def _preflate_streams(parts: Dict[str, bytes], entries: List[Dict]) -> Dict[int, bytes]:
     """Deflate streams rebuilt from fallback corrections, keyed by id(entry)."""
     todo = [e for e in entries if e['policy'].get('preflate') is not None
             and e['lfh']['method'] == METHOD_DEFLATE and not e['is_dir']]
     if not todo:
         return {}
-    pairs = []
-    for e in todo:
-        src = input_dir / e['name']
-        if not src.is_file():
-            raise FileNotFoundError(f"Missing input file for entry: {e['name']}")
-        pairs.append((src.read_bytes(), e['policy']['preflate']))
+    pairs = [(_part(parts, e['name']), e['policy']['preflate']) for e in todo]
     streams = preflate_fallback.recreate(pairs)
     logging.info(f"Fallback rebuilt {len(streams)} deflated entries with preflate")
     return {id(e): s for e, s in zip(todo, streams)}
 
 
-def build_docx_bytes(input_dir: Path, entries: List[Dict], profile: Dict,
+def _part(parts: Dict[str, bytes], name: str) -> bytes:
+    try:
+        return parts[name]
+    except KeyError:
+        raise FileNotFoundError(f"parts tree has no {name}") from None
+
+
+def build_docx_bytes(parts: Dict[str, bytes], entries: List[Dict], profile: Dict,
                      archive_comment: bytes = b"") -> bytes:
     """
-    Build the archive in memory from the extracted parts and the pointer's
-    entry list (zip_layout.write_archive lays it out). Each deflated entry is
-    compressed with its own profile= or else `profile`, rebuilt from its
-    preflate corrections (all of a document's in one helper call), or - raw=1 -
-    copied from .zippy/raw/.
+    Build the archive in memory from the parts ({path in the parts tree:
+    bytes}) and the pointer's entry list (zip_layout.write_archive lays it out).
+    Each deflated entry is compressed with its own profile= or else `profile`,
+    rebuilt from its preflate corrections (all of a document's in one helper
+    call), or - raw=1 - copied from .zippy/raw/.
     """
-    rebuilt = _preflate_streams(input_dir, entries)
+    rebuilt = _preflate_streams(parts, entries)
 
     def part(ent):
         name, lfh, pol = ent['name'], ent['lfh'], ent['policy']
         if ent['is_dir']:
             return zip_layout.dir_data(lfh['method']), 0, 0
-        src = input_dir / name
-        if not src.is_file():
-            raise FileNotFoundError(f'Missing input file for entry: {name}')
-        raw = src.read_bytes()
+        raw = _part(parts, name)
         crc32 = zlib.crc32(raw) & 0xFFFFFFFF
         if lfh['method'] == METHOD_STORE:
             comp = raw
         elif lfh['method'] != METHOD_DEFLATE:
             raise ValueError(f'Unsupported method {lfh["method"]} for {name}')
         elif pol.get('raw'):
-            stored = input_dir / zip_layout.RAW_DIR / name
-            if not stored.is_file():
-                raise FileNotFoundError(f'Missing raw bytes for entry: {name}')
-            comp = stored.read_bytes()
+            comp = _part(parts, f"{zip_layout.RAW_DIR}/{name}")
         elif id(ent) in rebuilt:
             comp = rebuilt[id(ent)]
         else:
             own = profile_for(pol['profile']) if pol.get('profile') else profile
-            comp = _compress_raw_deflate(raw, own, pol.get('flush_offsets', ()),
-                                         pol.get('break_kind', compression_profiles.BREAK_NONE))
+            if own['kind'] == pointer_format.FALLBACK_PROFILE:
+                raise ValueError(f"{name}: PROFILE fallback, but the entry has neither "
+                                 f"preflate data nor raw=1")
+            comp = compression_profiles.compress_entry(
+                raw, own, pol.get('break_kind', compression_profiles.BREAK_NONE),
+                pol.get('flush_offsets', ()))
         return comp, crc32, len(raw)
 
     return zip_layout.write_archive(entries, part, archive_comment)
 
-def repo_from_cwd():
-    """
-    Find pyit2 repository on current path.
-    """
-    repo = pygit2.Repository(pygit2.discover_repository(Path.cwd()))
-    logging.debug(f"Opened repo at {repo.path}")
-    return repo
 
-def extract_tree(repo, tree, path: Path, _pending=None):
+def read_parts(repo, tree: pygit2.Tree) -> Dict[str, bytes]:
     """
-    Extract xml files from a git tree to a specified path.
+    Every file of a parts tree, {path: bytes}, in memory.
 
-    A blob that is an LFS pointer is a part kept in LFS (see lfs_parts.py). Those
-    are collected while walking and resolved together at the end, so that the
-    ones missing locally are fetched in one parallel batch rather than one at a
-    time in tree order.
+    A blob that is an LFS pointer is a part kept in LFS (see lfs_parts.py).
+    Those are collected while walking and resolved together at the end, so
+    that the ones missing locally are fetched in one parallel batch rather than
+    one at a time in tree order.
     """
-    top = _pending is None
-    pending = {} if top else _pending
-    path.mkdir(parents=True, exist_ok=True)
-    logging.debug(f"Extracting tree to {path}")
-    for entry in tree:
-        full_path = path / entry.name
-        obj = repo[entry.id]
-        if entry.filemode == pygit2.GIT_FILEMODE_TREE:
-            extract_tree(repo, obj, full_path, pending)
-        else:
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            data = obj.read_raw()
+    parts: Dict[str, bytes] = {}
+    pending: Dict[tuple, List[str]] = {}
+
+    def walk(t, prefix):
+        for entry in t:
+            path = prefix + entry.name
+            if entry.filemode == pygit2.GIT_FILEMODE_TREE:
+                walk(repo[entry.id], path + "/")
+                continue
+            data = repo[entry.id].read_raw()
             ptr = lfs_parts.parse_pointer(data)
             if ptr is not None:
-                pending.setdefault(ptr, []).append(full_path)
-                continue
-            full_path.write_bytes(data)
-            logging.debug(f"Extracted file: {full_path}")
-    if top and pending:
+                pending.setdefault(ptr, []).append(path)
+            else:
+                parts[path] = data
+
+    walk(tree, "")
+    if pending:
         contents = lfs_parts.resolve_all(repo, {oid: size for oid, size in pending})
         for (oid, _size), paths in pending.items():
             for p in paths:
-                p.write_bytes(contents[oid])
-                logging.debug(f"Extracted LFS part: {p} ({oid})")
+                parts[p] = contents[oid]
+    return parts
+
 
 def profile_for(profile_name):
     """
     The profile a pointer's PROFILE line, or an entry's profile=, names - no search.
 
-    `fallback` means clean found no profile for any entry. A name this version does not know is an error,
-    not a reason to guess: the pointer was written by a newer extension.
+    `fallback` means clean found no profile for any entry: every deflated entry
+    then carries preflate data or raw=1, so nothing is compressed with a
+    profile. A name this version does not know is an error, not a reason to
+    guess: the pointer was written by a newer extension.
     """
-    if profile_name == pointer_format.ORIGINAL_PROFILE:
-        return {"name": profile_name, "kind": "original"}
-    if profile_name == pointer_format.FALLBACK_PROFILE:
-        # Entries with preflate corrections are rebuilt from those; this zlib
-        # profile only serves deflated entries the fallback could not model.
-        logging.info("Pointer records the fallback: preflate corrections where present, "
-                     f"otherwise {compression_profiles.describe(compression_profiles.FALLBACK)}")
-        return compression_profiles.FALLBACK
+    if profile_name in (pointer_format.ORIGINAL_PROFILE, pointer_format.FALLBACK_PROFILE):
+        return {"name": profile_name, "kind": profile_name}
     named = compression_profiles.BY_NAME.get(profile_name)
     if named is None:
         raise ValueError(f"pointer names compression profile {profile_name!r}, which this "
@@ -168,26 +144,12 @@ def profile_for(profile_name):
     return named
 
 
-def recompress_docx(input_dir: Path, entries: List[Dict], profile: Dict,
-                    archive_comment: bytes = b"") -> Tuple[bytes, str, dict]:
-    """
-    Rebuild the archive once, with `profile`. Return (docx_bytes, profile_name,
-    meta); the caller compares meta['sha'] with the committed hash.
-    """
-    docx_bytes = build_docx_bytes(input_dir, entries, profile, archive_comment)
-    sha = calculate_sha256(docx_bytes)
-    logging.info(f"Profile {profile['name']} SHA256={sha}")
-    meta = {"profile": profile, "level": profile.get("level"),
-            "memLevel": profile.get("memlevel"), "sha": sha}
-    return docx_bytes, profile["name"], meta
-
-
 def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
     """
     Recreate the original document from the pointer.
 
     1) Load the parts tree the pointer names, BY OID.
-    2) Extract it to a temp folder.
+    2) Read it into memory.
     3) Recompress to reproduce the original archive.
 
     Resolving by oid rather than by ref name is what makes checking out an older
@@ -199,7 +161,7 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
     logging.info(f"Creating document from parts tree {tree_oid} "
                  f"(pointer format {pointer_format.format_version(ptr.version)})")
     # Settle the profile first: an unknown or unavailable one fails here,
-    # before any parts are extracted or images downloaded.
+    # before any parts are read or images downloaded.
     profile_def = profile_for(ptr.profile)
     for name in sorted({e['policy']['profile'] for e in ptr.entries if e['policy'].get('profile')}):
         profile_for(name)                 # unknown or unavailable: fail now
@@ -221,50 +183,36 @@ def recreate_docx(repo, ptr: "pointer_format.Pointer", path: str = "<unknown>"):
             f"parts tree {tree_oid} is not in this repository ({e}), nor in the remote "
             f"parts container. Check 'git zippy env', then 'git fetch'; if that does "
             f"not help, it was never pushed.") from e
+    tree = obj.peel(pygit2.Tree)
 
-    if isinstance(obj, pygit2.Tree):
-        tree = obj
-    elif isinstance(obj, pygit2.Commit):
-        tree = obj.tree
+    parts = read_parts(repo, tree)
+    if profile_def["kind"] == pointer_format.ORIGINAL_PROFILE:
+        # Stored whole: nothing to rebuild, the hash check still applies.
+        docx_bytes = _part(parts, zip_layout.ORIGINAL)
     else:
-        raise TypeError(f"{tree_oid} is a {type(obj).__name__}, not a tree")
+        docx_bytes = build_docx_bytes(parts, ptr.entries, profile_def,
+                                      ptr.archive.get('comment', b''))
+    sha = calculate_sha256(docx_bytes)
+    logging.info(f"Emit profile: {ptr.profile}, sha={sha}")
 
-    # Extract git tree to a temp folder and recompress it:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        extract_tree(repo, tree, tmp_path)
+    # Refuse rather than emit. A rebuild that does not match the committed
+    # hash is a different document, and writing it puts bytes on disk that
+    # git believes are the committed ones - the worst failure available to a
+    # version control tool. Raising here exits non-zero, and git then aborts
+    # the checkout leaving no file at all, not a truncated one.
+    if expected_hash and sha != expected_hash:
+        logging.error(f"Hash mismatch. Expected: {expected_hash}, Got: {sha} (profile={ptr.profile})")
+        raise ValueError(
+            f"rebuild does not match the committed hash (expected {expected_hash}, "
+            f"got {sha}, profile={ptr.profile})")
+    # Report the document by the name the user knows it by. The tree oid is
+    # in the log for anyone who needs it; on a corpus run a screen of hashes
+    # tells you nothing about which file just went past.
+    logging.info(f"Smudged {path}: profile={ptr.profile}, tree={tree_oid}")
+    # Debug printout to console; stderr because stdout carries the document.
+    sys.stderr.write(f"[zippy smudge] {path}: profile={ptr.profile}\n")
+    sys.stdout.buffer.write(docx_bytes)
 
-        if profile_def["kind"] == "original":
-            # Stored whole: nothing to rebuild, the hash check still applies.
-            stored = tmp_path / zip_layout.ORIGINAL
-            if not stored.is_file():
-                raise FileNotFoundError(f"parts tree {tree_oid} has no {zip_layout.ORIGINAL}")
-            docx_bytes, profile = stored.read_bytes(), profile_def["name"]
-            meta = {"level": None, "memLevel": None, "sha": calculate_sha256(docx_bytes)}
-        else:
-            docx_bytes, profile, meta = recompress_docx(tmp_path, ptr.entries, profile_def,
-                                                        ptr.archive.get('comment', b''))
-
-        # Log outcome
-        logging.info(f"Emit profile: {profile}, level={meta['level']}, memLevel={meta['memLevel']}, sha={meta['sha']}")
-
-        # Refuse rather than emit. A rebuild that does not match the committed
-        # hash is a different document, and writing it puts bytes on disk that
-        # git believes are the committed ones - the worst failure available to a
-        # version control tool. Raising here exits non-zero, and git then aborts
-        # the checkout leaving no file at all, not a truncated one.
-        if expected_hash and meta["sha"] != expected_hash:
-            logging.error(f"Hash mismatch. Expected: {expected_hash}, Got: {meta['sha']} (profile={profile})")
-            raise ValueError(
-                f"rebuild does not match the committed hash (expected {expected_hash}, "
-                f"got {meta['sha']}, profile={profile})")
-        # Report the document by the name the user knows it by. The tree oid is
-        # in the log for anyone who needs it; on a corpus run a screen of hashes
-        # tells you nothing about which file just went past.
-        logging.info(f"Smudged {path}: profile={profile}, tree={tree_oid}")
-        # Debug printout to console; stderr because stdout carries the document.
-        sys.stderr.write(f"[zippy smudge] {path}: profile={profile}\n")
-        sys.stdout.buffer.write(docx_bytes)
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "<unknown>"

@@ -151,7 +151,7 @@ Document parts can be kept in Git LFS instead of the git object store. It is opt
 *.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
 ```
 
-The value lists part extensions (a bare `zippy-lfs` means `jpg,jpeg`). Without it nothing changes - pointers stay byte-identical to before.
+The value lists part extensions (a bare `zippy-lfs` means `jpg,jpeg,png,emf`, the same list `git zippy track --lfs` writes). Without it nothing changes - pointers stay byte-identical to before.
 
 - **clean** writes each matching part to the local LFS store (`.git/lfs/objects`) and puts the standard three-line LFS pointer in the parts tree. No `git lfs` process is started.
 - **smudge** reads pointers back from the local store and fetches only missing objects, through `git lfs smudge`, several at a time. Endpoint and credentials come from `.lfsconfig` and your credential helper as usual.
@@ -162,9 +162,7 @@ In a fresh clone, `git lfs fetch --all origin` after fetching the parts containe
 ## Upcoming work
 - Long-running filter (`filter.zippy.process = git-zippy filter-process`), in the Rust version: the repository and pack indexes are opened once per git command instead of once per document, and git's delayed checkout lets smudge rebuild documents in parallel. (In the Python version ~0.13 s of a small document's clean is interpreter and pygit2 start-up, about an hour per 30k documents.)
 - Cache of fitted breaks and preflate corrections keyed by the compressed part's SHA-256 and the profile, so unchanged parts and repeated images skip the work on re-add and renormalize.
-- Unpack and rebuild in memory: clean writes the document to a temp folder, unpacks it and inflates every part again for the profile check (0.83 s of a 17 MB document's clean); smudge extracts the tree to a temp folder and reads it back.
 - More known profiles as samples come in: Google Docs and Apple Pages exports, WPS/OnlyOffice, the Open XML SDK on .NET 8 and earlier for Windows (zlib-intel), Node's built-in zlib (Chromium's), Info-ZIP's default level for images (a port of its deflate).
-- `zippy-lfs` for PNG and EMF as well as JPG: the largest parts in the samples are a 6.7 MB EMF and a 3.2 MB PNG.
 - Unit and integration testing
 - Extending documentation
 - Rewriting to Rust (links preflate-rs directly instead of the helper)

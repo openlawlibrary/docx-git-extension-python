@@ -27,7 +27,8 @@ Opt-in, per document path, through a git attribute on the document:
     *.docx filter=zippy merge=binary -text zippy-lfs=jpg,jpeg,png,emf
 
 The value is a comma-separated list of part extensions; a bare `zippy-lfs`
-means jpg,jpeg. Unspecified means no part goes to LFS, which is exactly the
+means DEFAULT_EXTENSIONS (jpg,jpeg,png,emf), the same list `git zippy track
+--lfs` writes. Unspecified means no part goes to LFS, which is exactly the
 behaviour before this module existed, so documents that do not opt in keep
 the pointers they already have.
 
@@ -63,7 +64,7 @@ POINTER_VERSION = b"version https://git-lfs.github.com/spec/v1\n"
 MAX_POINTER_SIZE = 1024
 
 ATTRIBUTE = "zippy-lfs"
-DEFAULT_EXTENSIONS = frozenset({"jpg", "jpeg"})
+DEFAULT_EXTENSIONS = ("jpg", "jpeg", "png", "emf")   # bare zippy-lfs, and track --lfs
 
 _OID_RE = re.compile(rb"^oid sha256:([0-9a-f]{64})$")
 _SIZE_RE = re.compile(rb"^size (\d+)$")

@@ -84,21 +84,8 @@ def write_archive(entries: List[Dict], part: PartFn, archive_comment: bytes = b"
     return out.getvalue()
 
 
-def first_difference(a: bytes, b: bytes) -> int:
-    """Offset of the first differing byte (or of the shorter end)."""
-    n = min(len(a), len(b))
-    lo, hi = 0, n
-    while lo < hi:                       # binary search on slices: fast for large documents
-        mid = (lo + hi) // 2
-        if a[lo:mid + 1] == b[lo:mid + 1]:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
-
-
 def safe_name(name: str) -> bool:
-    """A name smudge can use as a path inside its scratch folder, and not ours."""
+    """A name that can be a path in the parts tree, and is not one of ours."""
     if not name or name.startswith("/") or "\\" in name or ":" in name or "\0" in name:
         return False
     parts = name.rstrip("/").split("/")

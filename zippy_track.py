@@ -27,8 +27,10 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import lfs_parts
+
 ATTRS = "filter=zippy merge=binary -text"
-DEFAULT_LFS = "jpg,jpeg,png,emf"
+DEFAULT_LFS = ",".join(lfs_parts.DEFAULT_EXTENSIONS)
 REQUIRED = ("merge=binary", "-text")
 
 

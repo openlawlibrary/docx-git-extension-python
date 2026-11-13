@@ -66,13 +66,12 @@ from typing import Dict, List, Optional, Tuple
 
 import block_breaks
 import msword_compressor
+from pointer_format import BREAK_NONE, BREAK_FULL, BREAK_BLOCK
 
 try:
     from zlib_ng import zlib_ng           # pip install zlib-ng
 except ImportError:                       # word-web profiles unavailable
     zlib_ng = None
-
-BREAK_NONE, BREAK_FULL, BREAK_BLOCK = 0, 1, 2
 
 BREAK_NAMES = {BREAK_NONE: 'none', BREAK_FULL: 'full_flush', BREAK_BLOCK: 'block'}
 
@@ -102,9 +101,6 @@ BY_NAME = {p['name']: p for p in PROFILES}
 # what the libz-based fitter runs.
 def fittable(profile: Dict) -> bool:
     return profile['kind'] == 'zlib' and not profile.get('tail')
-
-
-ZLIB_PROFILES = [p for p in PROFILES if fittable(p)]
 
 
 def is_available(profile: Dict) -> bool:
@@ -138,27 +134,10 @@ def accepts(profile: Dict, shape: str) -> bool:
         return shape == 'tail'
     return shape == 'plain'
 
-# `PROFILE fallback` (pointer_format.FALLBACK_PROFILE) rebuilds entries from
-# their preflate corrections (preflate_fallback.py). This profile only serves a
-# deflated entry the fallback could not model, or a pointer written without the
-# helper; the hash check at checkout decides whether that worked.
-FALLBACK = BY_NAME['python-docx']
-
 
 def compress_entry(data: bytes, profile: Dict, break_kind: int = BREAK_NONE,
                    breaks: Tuple[int, ...] = ()) -> bytes:
     """Raw DEFLATE for one entry under `profile`, replaying `breaks`."""
-    kind = profile['kind']
-    if kind == 'msword':
-        # Word's offsets are full flushes; a block break means nothing here.
-        return msword_compressor.compress_raw_deflate_msword(
-            data, breaks if break_kind == BREAK_FULL else ())
-    if kind == 'zlib' and fittable(profile):
-        if break_kind == BREAK_FULL:
-            raise ValueError('full-flush breaks are not supported by zlib profiles')
-        return block_breaks.compress_with_breaks(
-            data, breaks if break_kind == BREAK_BLOCK else (),
-            profile['level'], profile['memlevel'], profile.get('strategy', 0))
     return b''.join(iter_compress_entry(data, profile, break_kind, breaks))
 
 
@@ -177,7 +156,9 @@ def _iter_plain(module, data: bytes, profile: Dict):
 
 def iter_compress_entry(data: bytes, profile: Dict, break_kind: int = BREAK_NONE,
                         breaks: Tuple[int, ...] = ()):
-    """compress_entry(), yielding output as it is produced (for early exit)."""
+    """compress_entry(), yielding output as it is produced (for early exit).
+    The one place that turns a profile into a compressor: clean verifies with
+    it and smudge rebuilds with it, so the two cannot drift apart."""
     kind = profile['kind']
     if kind == 'msword':
         return msword_compressor.iter_compress_msword(

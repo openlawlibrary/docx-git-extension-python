@@ -28,7 +28,7 @@ TWO HALVES, DIFFERENT REQUIREMENTS
                 inflate() with Z_BLOCK. Without libz it returns None and the
                 caller falls back to the existing behaviour.
 
-  compress_with_breaks()  runs in the SMUDGE filter. It uses only the Python
+  iter_compress_with_breaks()  runs in the SMUDGE filter. It uses only the Python
                 zlib module, so a rebuild works on hosts with no shared libz.
                 That asymmetry is deliberate: checkout must not depend on a
                 library that packing happened to have.
@@ -45,6 +45,8 @@ import logging
 import zlib
 from typing import Optional, Tuple
 
+from utils.utils import common_prefix
+
 Z_OK, Z_STREAM_END, Z_BLOCK, Z_BUF_ERROR = 0, 1, 5, -5
 
 # Input is fed to the compressor in pieces of this size, so output appears as
@@ -57,7 +59,7 @@ STREAM_CHUNK = 1 << 16
 _DATA_TYPE_BLOCK_END = 128
 
 
-class _ZStream(ctypes.Structure):
+class ZStream(ctypes.Structure):
     """zlib's z_stream, as laid out by the platform C compiler."""
     _fields_ = [
         ('next_in',   ctypes.c_void_p), ('avail_in',  ctypes.c_uint),
@@ -74,11 +76,11 @@ _libz: Optional[ctypes.CDLL] = None
 _libz_loaded = False
 
 
-def _load_libz() -> Optional[ctypes.CDLL]:
+def load_libz() -> Optional[ctypes.CDLL]:
     """
-    Bind libz once, lazily. Only the inflate side is needed here; this is kept
-    separate from msword_compressor's binding on purpose, because that one
-    insists on deflateTune and this one must work without it.
+    Bind the shared zlib once, lazily; None when there is none. Shared by the
+    break scanner here (inflate side) and msword_compressor (deflate side, which
+    also needs deflateTune and checks for it itself).
     """
     global _libz, _libz_loaded
     if _libz_loaded:
@@ -92,24 +94,30 @@ def _load_libz() -> Optional[ctypes.CDLL]:
         except OSError:
             continue
         try:
-            lib.inflateInit2_.argtypes = [ctypes.POINTER(_ZStream), ctypes.c_int,
+            lib.inflateInit2_.argtypes = [ctypes.POINTER(ZStream), ctypes.c_int,
                                           ctypes.c_char_p, ctypes.c_int]
-            lib.inflate.argtypes = [ctypes.POINTER(_ZStream), ctypes.c_int]
-            lib.inflateEnd.argtypes = [ctypes.POINTER(_ZStream)]
-            lib.inflateCopy.argtypes = [ctypes.POINTER(_ZStream), ctypes.POINTER(_ZStream)]
+            lib.inflate.argtypes = [ctypes.POINTER(ZStream), ctypes.c_int]
+            lib.inflateEnd.argtypes = [ctypes.POINTER(ZStream)]
+            lib.inflateCopy.argtypes = [ctypes.POINTER(ZStream), ctypes.POINTER(ZStream)]
+            lib.deflateInit2_.argtypes = [ctypes.POINTER(ZStream)] + [ctypes.c_int] * 5 + \
+                                         [ctypes.c_char_p, ctypes.c_int]
+            lib.deflate.argtypes = [ctypes.POINTER(ZStream), ctypes.c_int]
+            lib.deflateEnd.argtypes = [ctypes.POINTER(ZStream)]
+            if hasattr(lib, 'deflateTune'):
+                lib.deflateTune.argtypes = [ctypes.POINTER(ZStream)] + [ctypes.c_int] * 4
             lib.zlibVersion.restype = ctypes.c_char_p
         except AttributeError:
             continue
         _libz = lib
-        logging.debug(f'block_breaks: bound {name}, zlib {lib.zlibVersion().decode()}')
+        logging.debug(f'bound {name}, zlib {lib.zlibVersion().decode()}')
         return _libz
-    logging.warning('block_breaks: no shared zlib found; block-break fitting unavailable')
+    logging.warning('no shared zlib found; block-break fitting and the msword profile unavailable')
     return None
 
 
 def is_available() -> bool:
     """True when boundaries can be scanned on this host (clean side only)."""
-    return _load_libz() is not None
+    return load_libz() is not None
 
 
 def supports_z_block() -> bool:
@@ -129,7 +137,7 @@ def supports_z_block() -> bool:
         return False
 
 
-def scan_boundaries(comp: bytes, usize: int, partial: bool = False) -> Tuple[int, ...]:
+def scan_boundaries(comp: bytes, usize: int) -> Tuple[int, ...]:
     """
     Uncompressed offset of EVERY deflate block end in the stream, in order,
     duplicates included.
@@ -140,19 +148,16 @@ def scan_boundaries(comp: bytes, usize: int, partial: bool = False) -> Tuple[int
 
     Duplicates are information, not noise: a block that produces no output is an
     empty block, which is the footprint Z_SYNC_FLUSH and Z_FULL_FLUSH leave
-    behind. `has_empty_blocks` reads them.
-
-    With `partial`, `comp` may be a prefix of a stream: scanning stops where the
-    input runs out and returns the boundaries of the blocks that were complete.
+    behind. `empty_blocks` reads them.
     """
     if usize <= 0 or not comp:
         return ()
-    lib = _load_libz()
+    lib = load_libz()
     if lib is None:
         return ()
 
-    s = _ZStream()
-    rc = lib.inflateInit2_(ctypes.byref(s), -15, b'1.2.11', ctypes.sizeof(_ZStream))
+    s = ZStream()
+    rc = lib.inflateInit2_(ctypes.byref(s), -15, b'1.2.11', ctypes.sizeof(ZStream))
     if rc != Z_OK:
         raise RuntimeError(f'inflateInit2 failed: {rc}')
     try:
@@ -168,8 +173,6 @@ def scan_boundaries(comp: bytes, usize: int, partial: bool = False) -> Tuple[int
         while True:
             rc = lib.inflate(ctypes.byref(s), Z_BLOCK)
             if rc == Z_STREAM_END:
-                break
-            if partial and (rc == Z_BUF_ERROR or s.avail_in == 0):
                 break
             if rc != Z_OK:
                 raise RuntimeError(f'inflate failed: {rc}')
@@ -197,22 +200,11 @@ def block_ends(comp: bytes, usize: int) -> Tuple[int, ...]:
     return tuple(out)
 
 
-def has_empty_blocks(comp: bytes, usize: int) -> bool:
-    """
-    True when the stream contains a block that produced no output.
-
-    Used to skip the expensive Python flush scan: no empty block anywhere means
-    no Z_FULL_FLUSH anywhere, so the flush-offset list is necessarily empty.
-    Equivalent to the slow answer, obtained roughly 300x faster.
-    """
-    offs = scan_boundaries(comp, usize)
-    return any(offs[i] == offs[i - 1] for i in range(1, len(offs)))
-
-
 def empty_blocks(comp: bytes, usize: int) -> Tuple[bool, Tuple[int, ...]]:
     """
-    One scan, two answers: (any empty block at all, flush offsets as returned
-    by flush_offsets()). An empty block anywhere - including the trailing one
+    One scan, two answers: (any empty block at all, the offsets of the empty
+    blocks inside the stream - Word's full flushes - excluding the structural
+    one at the very end). An empty block anywhere - including the trailing one
     a sync flush leaves - rules out every plain zlib profile, which never
     writes one.
     """
@@ -221,23 +213,16 @@ def empty_blocks(comp: bytes, usize: int) -> Tuple[bool, Tuple[int, ...]]:
     return bool(dups), tuple(sorted(o for o in dups if o != usize))
 
 
-def flush_offsets(comp: bytes, usize: int) -> Tuple[int, ...]:
-    """
-    Uncompressed offsets of the empty blocks inside a stream - Word's piece
-    boundaries - excluding the structural flush at the very end.
-
-    Same answer as msword_compressor.detect_flush_offsets() for Word streams,
-    read with libz instead of a Python bit walker (that walker was most of a
-    clean's time on documents with large deflated images).
-    """
-    offs = scan_boundaries(comp, usize)
-    return tuple(sorted({offs[i] for i in range(1, len(offs))
-                         if offs[i] == offs[i - 1] and offs[i] != usize}))
-
-
 def iter_compress_with_breaks(data: bytes, breaks=(), level: int = 5,
                               memlevel: int = 8, strategy: int = 0):
-    """compress_with_breaks(), yielding output as it is produced."""
+    """
+    Raw DEFLATE with a block forced to end at each offset in `breaks`, yielded
+    as it is produced (so a comparison can stop at the first difference).
+
+    Z_BLOCK ends the block without emitting a marker, which is what makes this
+    reproduce the original rather than merely resemble it. Uses only the Python
+    zlib module, so the smudge side needs no libz.
+    """
     co = zlib.compressobj(level, zlib.DEFLATED, -15, memlevel, strategy)
     prev = 0
     for off in tuple(breaks) + (len(data),):
@@ -279,36 +264,13 @@ def matching_prefix(chunks, target: bytes) -> int:
         for c in chunks:
             n = len(c)
             if target[pos:pos + n] != c:
-                return pos + _common_prefix(c, target[pos:pos + n])
+                return pos + common_prefix(c, target[pos:pos + n])
             pos += n
         return pos
     finally:
         close = getattr(chunks, 'close', None)
         if close:
             close()
-
-
-def compress_with_breaks(data: bytes, breaks=(), level: int = 5,
-                         memlevel: int = 8, strategy: int = 0) -> bytes:
-    """
-    Raw DEFLATE with a block forced to end at each offset in `breaks`.
-
-    Z_BLOCK ends the block without emitting a marker, which is what makes this
-    reproduce the original rather than merely resemble it. Uses only the Python
-    zlib module, so the smudge side needs no libz.
-    """
-    co = zlib.compressobj(level, zlib.DEFLATED, -15, memlevel, strategy)
-    out = []
-    prev = 0
-    for off in breaks:
-        if off <= prev or off > len(data):
-            raise ValueError(f'block break {off} out of order or past end of data')
-        out.append(co.compress(data[prev:off]))
-        out.append(co.flush(zlib.Z_BLOCK))
-        prev = off
-    out.append(co.compress(data[prev:]))
-    out.append(co.flush(zlib.Z_FINISH))
-    return b''.join(out)
 
 
 class _Inflater:
@@ -324,13 +286,13 @@ class _Inflater:
 
     def __init__(self, lib, usize: int, _copy_of: "_Inflater" = None):
         self.lib = lib
-        self.s = _ZStream()
+        self.s = ZStream()
         if _copy_of is None:
             # One output buffer for a decoder and all its copies. inflate()
             # back-references its own window, not this buffer, across calls, so
             # copies writing over each other's later output is harmless.
             self.dst = (ctypes.c_ubyte * max(usize, 1))()
-            rc = lib.inflateInit2_(ctypes.byref(self.s), -15, b'1.2.11', ctypes.sizeof(_ZStream))
+            rc = lib.inflateInit2_(ctypes.byref(self.s), -15, b'1.2.11', ctypes.sizeof(ZStream))
             if rc != Z_OK:
                 raise RuntimeError(f'inflateInit2 failed: {rc}')
             self.s.next_out = ctypes.cast(self.dst, ctypes.c_void_p)
@@ -399,7 +361,7 @@ def fit_breaks(data: bytes, target: bytes, usize: int, level: int = 5,
     original's block ends, in increasing order, so there are at most
     len(original block ends) + 1 rounds. `rounds` can still cap it.
     """
-    lib = _load_libz()
+    lib = load_libz()
     if lib is None:
         return None
     try:
@@ -490,15 +452,3 @@ def fit_breaks(data: bytes, target: bytes, usize: int, level: int = 5,
         return None
     finally:
         parked.close()
-
-
-def _common_prefix(a: bytes, b: bytes) -> int:
-    n = min(len(a), len(b))
-    lo, hi = 0, n
-    while lo < hi:                             # binary search; the streams are large
-        mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
